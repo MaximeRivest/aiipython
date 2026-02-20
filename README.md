@@ -25,11 +25,13 @@ In [7]: chat("openai/gpt-4o-mini")     # switch model
 
 | Command | Description |
 |---|---|
-| `/model` | Interactive model picker menu |
+| `/model` | Interactive model picker menu (live discovery + recents + TabMinion) |
+| `/model refresh` | Force-refresh live model discovery |
 | `/model <provider/name>` | Switch model directly |
 | `/image <path>` | Load image into `images` dict |
 | `/login` | Interactive login provider menu |
 | `/login anthropic` | OAuth login (Claude Pro/Max subscription) |
+| `/login openai` | OAuth login (ChatGPT Plus/Pro via Codex OAuth; Pi-compatible token import/login) |
 | `/login <provider> <api_key>` | Persist API key in `~/.aiipython/auth.json` (e.g. `openai`, `gemini`) |
 | `/logout <provider>` | Remove stored credentials |
 | `/auth` | Show auth sources and what's active |
@@ -84,15 +86,33 @@ costs from billed API keys in your environment.
 
 ```
 /login anthropic             # OAuth login → Claude Pro/Max subscription
-/login openai sk-...         # Persist OpenAI key in auth.json
+/login openai                # OAuth login → ChatGPT Plus/Pro (Codex)
+/login openai sk-...         # (optional) Persist OpenAI API key in auth.json
 /login gemini AIza...        # Persist Gemini key in auth.json
 /auth                        # Show what's active and where each key comes from
-/logout anthropic            # Remove stored credentials, fall back to env var
+/logout openai               # Remove stored OpenAI/Codex credentials
 ```
 
 The footer always shows the active auth source so you know what you're
-using.  Credentials are stored in `~/.aiipython/auth.json` with `0600`
+using. Credentials are stored in `~/.aiipython/auth.json` with `0600`
 permissions.
+
+On first use, aiipython also auto-imports compatible credentials from
+`~/.codex/auth.json` and `~/.pi/agent/auth.json` (when present), so your
+existing Codex/Pi OAuth logins can be reused.
+
+Pi's `openai-codex/*` models use a custom ChatGPT backend transport
+(`chatgpt.com/backend-api`) that is different from standard OpenAI Platform
+`openai/*` API calls. aiipython now supports both paths:
+
+- `openai-codex/*` → ChatGPT Plus/Pro OAuth subscription transport
+- `openai/*` → OpenAI Platform API key transport
+
+Example:
+
+```
+/model openai-codex/gpt-5.3-codex
+```
 
 ## Remembered Model & Menus
 
@@ -106,6 +126,10 @@ On next launch, default resolution is:
 
 `/model` and `/login` both open interactive numbered menus. Type a number,
 paste a value directly, or `q` to cancel.
+
+`/model` also performs live, auth-aware discovery (Anthropic/OpenAI/Gemini)
+plus TabMinion services when available, then caches results briefly for speed.
+Use `/model refresh` to force a rescan.
 
 ## TabMinion (Browser Subscriptions)
 

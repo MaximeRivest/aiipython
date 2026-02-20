@@ -56,6 +56,10 @@ class Kernel:
             ns["ai_responses"] = []
         if "agent_context" not in ns:
             ns["agent_context"] = ""
+
+        from aiipython.context import ensure_context_namespace
+        ensure_context_namespace(ns)
+
         ns["_kernel"] = self
 
     # ── execute code ────────────────────────────────────────────────
@@ -147,6 +151,9 @@ class Kernel:
             "In", "Out", "get_ipython", "exit", "quit", "open",
             "_kernel", "_oh", "_dh", "_ih", "_ii", "_iii", "_i",
             "terminal_history", "chat",
+            "agent", "spawn_agent", "look_at",
+            "context_add", "context_add_file", "context_add_text",
+            "context_remove", "context_clear", "context_list",
         }
         out: dict[str, str] = {}
         for k, v in sorted(ns.items()):

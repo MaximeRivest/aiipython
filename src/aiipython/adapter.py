@@ -13,6 +13,8 @@ Template elements
   {agent_context()}       Custom helper: reads `agent_context` from the
                           namespace.  The AI writes to this variable to
                           persist notes, plans, and context across turns.
+  {pinned_context()}      Human-managed context refs (files/text) added via
+                          @mentions and /context; file refs are re-read live.
   {environment_state}     The compact namespace + activity log from the kernel
   {active_images()}       Custom helper: renders looked-at images inline
                           (each becomes an image_url content block via DSPy's
@@ -104,9 +106,9 @@ tree to undo, branch, and restore:
 If the user undoes your work and asks you to try again, check
 agent_context and the activity log to understand what was tried before.
 
-The session summary and agent_context live in this system prompt.
-The namespace snapshot and recent activity live in the user message.
-You never see raw variable contents unless you print() them.
+The session summary, agent_context, and pinned human context live in this
+system prompt. The namespace snapshot and recent activity live in the user
+message. You never see raw variable contents unless you print() them.
 
 ## Behavior
 
@@ -114,7 +116,8 @@ You never see raw variable contents unless you print() them.
 - When done, respond with just text (no code blocks).
 - The user's messages are in `user_inputs` (latest last) and `user_input`.
 - Update `agent_context` whenever your working context changes.
-{agent_context()}{session_summary()}"""
+- Treat pinned context as user-prioritized and keep it in mind.
+{agent_context()}{pinned_context()}{session_summary()}"""
 
 USER_TEMPLATE = """\
 {environment_state}{active_images()}"""
@@ -171,8 +174,9 @@ def _trunc(text: str, limit: int = 100) -> str:
 def build_adapter(agent: ReactiveAgent) -> TemplateAdapter:
     """Create a TemplateAdapter wired to *agent*'s live state.
 
-    Three custom helpers read from the agent at render time:
+    Four custom helpers read from the agent at render time:
       {agent_context()}    — the AI's own scratchpad (system prompt)
+      {pinned_context()}   — human-managed persistent refs (system prompt)
       {session_summary()}  — high-level session timeline (system prompt)
       {active_images()}    — multimodal image injection (user message)
     """
@@ -194,6 +198,12 @@ def build_adapter(agent: ReactiveAgent) -> TemplateAdapter:
         if not ac or not ac.strip():
             return ""
         return f"\n## Agent Context (your notes)\n{ac.strip()}\n"
+
+    # ── helper: {pinned_context()} ──────────────────────────────────
+    def pinned_context_helper(
+        ctx: dict, signature: type[Signature], demos: list, **kwargs
+    ) -> str:
+        return agent.render_pinned_context()
 
     # ── helper: {session_summary()} ─────────────────────────────────
     def session_summary_helper(
@@ -242,6 +252,7 @@ def build_adapter(agent: ReactiveAgent) -> TemplateAdapter:
         return "\n".join(parts)
 
     adapter.register_helper("agent_context", agent_context_helper)
+    adapter.register_helper("pinned_context", pinned_context_helper)
     adapter.register_helper("session_summary", session_summary_helper)
     adapter.register_helper("active_images", active_images_helper)
 

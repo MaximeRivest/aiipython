@@ -101,13 +101,19 @@ def chat(model: str | None = None) -> None:
     # Putting persisted state ahead of env vars ensures "latest model
     # you picked" survives new host sessions even if your shell exports
     # a stale AIIPYTHON_MODEL value.
-    model_str = (
-        model
-        or settings.get_last_model()
-        or os.environ.get("AIIPYTHON_MODEL")
-        or os.environ.get("PYCODE_MODEL")  # legacy alias
-        or DEFAULT_MODEL
-    )
+    if model:
+        model_str = model
+    else:
+        candidates = [
+            settings.get_last_model(),
+            os.environ.get("AIIPYTHON_MODEL"),
+            os.environ.get("PYCODE_MODEL"),  # legacy alias
+            DEFAULT_MODEL,
+        ]
+        model_str = next(
+            (c for c in candidates if isinstance(c, str) and c.strip() and "/" in c),
+            DEFAULT_MODEL,
+        )
     # Persist whichever model we ended up using.
     settings.set_last_model(model_str)
 

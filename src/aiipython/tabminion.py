@@ -126,12 +126,17 @@ def litellm_model_kwargs(model_str: str) -> dict[str, Any]:
     """Return kwargs for litellm/dspy to route through TabMinion.
 
     ``tabminion/claude`` becomes ``openai/claude`` routed to localhost:8080.
+
+    Important: aiipython uses **fresh browser conversations per call** for
+    TabMinion models to keep runs deterministic and avoid leaking prior chat
+    state into the current tool turn.
     """
     service = parse_tabminion_model(model_str)
     return {
         "model": f"openai/{service}",
         "api_base": OPENAI_BASE,
         "api_key": "not-needed",
+        "conversation_mode": "new",  # always fresh conversation in TabMinion
     }
 
 
@@ -166,6 +171,7 @@ def status_summary() -> str:
             )
         lines.append("")
         lines.append("Use `/model tabminion/claude` (or chatgpt, grok, gemini) to switch.")
+        lines.append("TabMinion models in aiipython always run with `conversation_mode=new`.")
     else:
         lines.append(
             "\n⚠️ No AI tabs detected. Open ChatGPT, Claude, Grok, "

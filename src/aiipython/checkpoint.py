@@ -43,6 +43,8 @@ _SKIP_NAMES = frozenset({
     "terminal_history", "chat",
     # Agent-injected callables — rebuilt by ReactiveAgent.__init__
     "agent", "spawn_agent", "look_at",
+    "context_add", "context_add_file", "context_add_text",
+    "context_remove", "context_clear", "context_list",
 })
 
 

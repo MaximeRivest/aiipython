@@ -57,6 +57,7 @@ class Session:
                 api_base=tm_kwargs.pop("api_base"),
                 api_key=tm_kwargs.pop("api_key"),
                 cache=False,
+                **tm_kwargs,  # includes TabMinion extras (e.g. conversation_mode="new")
             )
             # TabMinion = browser subscription, always free
             self.auth_source = AuthSource(
