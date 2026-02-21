@@ -1,0 +1,11 @@
+{
+  "name": "aiipython-pi-gateway",
+  "private": true,
+  "type": "module",
+  "version": "0.1.0",
+  "description": "Pi model/auth gateway for aiipython DSPy backend",
+  "dependencies": {
+    "@mariozechner/pi-ai": "^0.52.10",
+    "@mariozechner/pi-coding-agent": "^0.52.10"
+  }
+}

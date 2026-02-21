@@ -26,6 +26,7 @@ from aiipython import __version__
 from aiipython.agent import ReactionStep
 from aiipython.auth import ENV_KEY_MAP, get_auth_manager
 from aiipython.context import summarize_items
+from aiipython.parser import strip_executable_fenced_code
 from aiipython.session import Session
 from aiipython.wire import WireEntry, format_wire_messages
 
@@ -74,9 +75,8 @@ def _abbrev_multiline(
 
 
 def _without_fenced_code(markdown: str) -> str:
-    """Return markdown with fenced code blocks removed."""
-    cleaned = re.sub(r"```[\w-]*\s*\n.*?```", "", markdown, flags=re.DOTALL)
-    return cleaned.strip()
+    """Return markdown with runnable fenced code blocks removed."""
+    return strip_executable_fenced_code(markdown)
 
 
 def _build_aiipython_theme(background: str) -> Theme:
@@ -378,7 +378,7 @@ class AiiPythonApp(App):
             yield VerticalScroll(id="wire-log")
         with Vertical(id="bottom-bar"):
             yield Input(
-                placeholder="Type a message… (@file, @clip, @ + paste, /model, /context)",
+                placeholder="Type a message… (@file, @clip, @ + paste, !cmd, !!cmd, /model, /context)",
                 id="user-input",
             )
             yield PiFooter(id="pi-footer")
@@ -432,6 +432,7 @@ class AiiPythonApp(App):
             "`ctrl+b` debug · "
             "`ctrl+w` wire\n"
             "Use `@file.py` (live) · `@clip` or `@ `+paste (snapshot)\n"
+            "`!cmd` IPython input · `!!cmd` same as `!cmd`\n"
             "`/model` `/context` `/image` `/login` `/logout` `/auth` `/tabminion`",
             role="system",
         ))
@@ -638,7 +639,7 @@ class AiiPythonApp(App):
         self._menu_options = []
         self._menu_on_select = None
         self.query_one("#user-input", Input).placeholder = (
-            "Type a message… (@file, @clip, @ + paste, /model, /context)"
+            "Type a message… (@file, @clip, @ + paste, !cmd, !!cmd, /model, /context)"
         )
 
     def _handle_menu_input(self, text: str) -> None:
@@ -708,6 +709,16 @@ class AiiPythonApp(App):
             self._refresh_inspector()
             return
 
+        # Shell shortcuts
+        # In aiipython, route both !cmd and !!cmd through IPython so they
+        # operate on the bound IPython process/state.
+        if text.startswith("!!") and len(text) > 2:
+            self._handle_ipython_shell(text[2:].strip())
+            return
+        if text.startswith("!") and len(text) > 1:
+            self._handle_ipython_shell(text[1:].strip())
+            return
+
         # Commands
         if text.startswith("/model"):
             self._handle_model(text[6:].strip())
@@ -730,6 +741,9 @@ class AiiPythonApp(App):
         if text == "/tabminion":
             self._handle_tabminion()
             return
+        if text.startswith("/traffic"):
+            self._handle_traffic(text[8:].strip())
+            return
 
         text, pinned_messages = self._consume_at_context_refs(text)
 
@@ -750,7 +764,7 @@ class AiiPythonApp(App):
         debug.mount(ChatMessage(f">>> USER:\n{text}", role="system"))
         debug.scroll_end(animate=False)
 
-        self.kernel.push_user_input(text)
+        self.kernel.push_user_input(text, source="chat", is_clipboard=False)
         self._refresh_inspector()
 
         # Thinking indicator
@@ -760,6 +774,29 @@ class AiiPythonApp(App):
         chat.scroll_end(animate=False)
 
         self._run_agent()
+
+    def _handle_ipython_shell(self, cmd: str) -> None:
+        """Run `!cmd` as IPython input in the bound aiipython session."""
+        chat = self.query_one("#chat-log")
+        if not cmd:
+            chat.mount(ChatMessage("Usage: `!<python_or_ipython_input>`", role="system"))
+            chat.scroll_end(animate=False)
+            return
+
+        chat.mount(ChatMessage(f"!{cmd}", role="user"))
+        entry = self.kernel.execute(cmd, tag="user")
+        chat.mount(ExecOutput(self._format_exec_output(entry), success=bool(entry.get("success", True))))
+
+        debug = self.query_one("#debug-log")
+        debug.mount(ChatMessage(f">>> USER IPYTHON INPUT:\n!{cmd}", role="system"))
+        debug.scroll_end(animate=False)
+
+        chat.scroll_end(animate=False)
+        self._refresh_inspector()
+
+    def _handle_local_shell(self, cmd: str) -> None:
+        """Backward-compatible alias: `!!cmd` now routes through IPython too."""
+        self._handle_ipython_shell(cmd)
 
     def _consume_at_context_refs(self, text: str) -> tuple[str, list[str]]:
         """Handle @mentions that pin live context references."""
@@ -1491,7 +1528,7 @@ class AiiPythonApp(App):
     def _login_success(self, provider: str) -> None:
         self._login_waiting_for_code = False
         inp = self.query_one("#user-input", Input)
-        inp.placeholder = "Type a message… (@file, @clip, @ + paste, /model, /context)"
+        inp.placeholder = "Type a message… (@file, @clip, @ + paste, !cmd, !!cmd, /model, /context)"
 
         chat = self.query_one("#chat-log")
         src = self.session.auth_source
@@ -1516,7 +1553,7 @@ class AiiPythonApp(App):
     def _login_error(self, msg: str) -> None:
         self._login_waiting_for_code = False
         inp = self.query_one("#user-input", Input)
-        inp.placeholder = "Type a message… (@file, @clip, @ + paste, /model, /context)"
+        inp.placeholder = "Type a message… (@file, @clip, @ + paste, !cmd, !!cmd, /model, /context)"
 
         chat = self.query_one("#chat-log")
         chat.mount(ChatMessage(f"❌ Login failed: {msg}", role="error"))
@@ -1655,6 +1692,37 @@ class AiiPythonApp(App):
         chat = self.query_one("#chat-log")
         from aiipython.tabminion import status_summary
         chat.mount(ChatMessage(status_summary(), role="system"))
+        chat.scroll_end(animate=False)
+
+    def _handle_traffic(self, arg: str) -> None:
+        chat = self.query_one("#chat-log")
+        from aiipython.wire_bridge import get_inspector_url
+        from aiipython import traffic_server
+
+        if arg == "stop":
+            traffic_server.stop()
+            chat.mount(ChatMessage("Traffic inspector stopped.", role="system"))
+        elif arg == "clear":
+            traffic_server._entries.clear()
+            traffic_server._ext_map.clear()
+            traffic_server._send_sse("clear", {})
+            chat.mount(ChatMessage("Traffic log cleared.", role="system"))
+        else:
+            url = get_inspector_url()
+            if url:
+                chat.mount(ChatMessage(
+                    f"Traffic inspector: **{url}**\n\n"
+                    f"{len(traffic_server._entries)} entries captured. "
+                    f"Opening in browser…",
+                    role="system",
+                ))
+                traffic_server._open_browser(url)
+            else:
+                port = traffic_server.start(open_browser=True)
+                chat.mount(ChatMessage(
+                    f"Traffic inspector started: **http://127.0.0.1:{port}**",
+                    role="system",
+                ))
         chat.scroll_end(animate=False)
 
 

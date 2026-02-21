@@ -1,0 +1,12 @@
+{
+  "name": "aiipython-pi-native-host",
+  "private": true,
+  "type": "module",
+  "version": "0.1.0",
+  "description": "Run Pi InteractiveMode against aiipython backend",
+  "dependencies": {
+    "@mariozechner/pi-ai": "^0.52.10",
+    "@mariozechner/pi-coding-agent": "^0.52.10",
+    "@sinclair/typebox": "^0.34.41"
+  }
+}

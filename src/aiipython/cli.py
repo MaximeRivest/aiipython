@@ -23,10 +23,22 @@ def main() -> None:
             "AIIPYTHON_MODEL env > gemini/gemini-3-flash-preview"
         ),
     )
+    parser.add_argument(
+        "--ui",
+        default=None,
+        choices=["pi-native", "pi-tui", "textual"],
+        help="Frontend UI: pi-native (default), pi-tui, or textual (legacy).",
+    )
+    parser.add_argument(
+        "--lm-backend",
+        default=None,
+        choices=["auto", "pi", "litellm"],
+        help="LM backend routing: auto (default), pi gateway, or litellm.",
+    )
     args = parser.parse_args()
 
     from aiipython import chat
-    chat(model=args.model)
+    chat(model=args.model, ui=args.ui, lm_backend=args.lm_backend)
 
 
 if __name__ == "__main__":

@@ -5,31 +5,91 @@ A reactive AI chat assistant running inside IPython.
 ## Quick start
 
 ```bash
+# Default frontend is pi-native (real Pi InteractiveMode).
+# Node.js + npm must be installed (deps auto-install on first run).
+
 # From the terminal
 uv run aiipython
 uv run aiipython -m openai/gpt-4o-mini
+# (after publish/install) uvx aiipython
+
+# Optional: force LM routing through Pi model/auth stack
+AIIPYTHON_LM_BACKEND=pi uv run aiipython
+
+# Optional: force custom pi-tui frontend
+AIIPYTHON_UI=pi-tui uv run aiipython
+
+# Optional: force legacy Textual frontend
+AIIPYTHON_UI=textual uv run aiipython
 
 # From IPython — your namespace is preserved
 $ ipython
 In [1]: import pandas as pd
 In [2]: df = pd.read_csv("data.csv")
 In [3]: from aiipython import chat
-In [4]: chat()                          # TUI sees df, pd, etc.
+In [4]: chat()                          # pi-native (real Pi UI) sees df, pd, etc.
         # ... ctrl+c to exit ...
 In [5]: df.describe()                   # back in IPython
 In [6]: chat()                          # re-enter, state preserved
 In [7]: chat("openai/gpt-4o-mini")     # switch model
+In [8]: chat(ui="textual")             # optional legacy frontend
+In [9]: chat(lm_backend="pi")          # force Pi model/auth gateway
 ```
+
+## Frontends
+
+aiipython now supports three frontends:
+
+- **pi-native (default)** — real Pi `InteractiveMode` UI from `@mariozechner/pi-coding-agent`, wired to aiipython backend semantics.
+- **pi-tui** — custom Node.js UI based on `@mariozechner/pi-tui`.
+- **textual (legacy)** — previous pure-Python Textual UI.
+
+Select frontend with:
+
+- Environment: `AIIPYTHON_UI=pi-native|pi-tui|textual`
+- Python API: `chat(ui="pi-native")`, `chat(ui="pi-tui")`, or `chat(ui="textual")`
+- CLI: `uv run aiipython --ui pi-native|pi-tui|textual`
+- LM backend override: `chat(lm_backend="pi")` or `uv run aiipython --lm-backend pi`
+
+Architecture details: [`docs/pi-tui-migration.md`](docs/pi-tui-migration.md)
+
+- Full Pi mode: [`docs/pi-native.md`](docs/pi-native.md)
+- LM routing via Pi stack: [`docs/pi-lm-gateway.md`](docs/pi-lm-gateway.md)
+
+`pi-native` is the mode that gives full Pi UX parity (autocomplete, history navigation,
+interactive selectors, queue semantics, footer pricing/status rendering).
+
+Backend-state mirroring for Pi branch navigation (`/tree` rewinds) is still being hardened;
+see [`docs/pi-native.md`](docs/pi-native.md).
+
+## LM Backends
+
+aiipython supports three LM backend modes (`AIIPYTHON_LM_BACKEND`):
+
+- `auto` (default): try Pi gateway first, fall back to litellm backend
+- `pi`: force Node Pi gateway (`@mariozechner/pi-ai` + `ModelRegistry` + `AuthStorage`)
+- `litellm`: force legacy Python litellm transport (`StreamingLM`)
+
+CLI equivalent:
+
+```bash
+uv run aiipython --lm-backend auto|pi|litellm
+```
+
+> Note: this phase routes LM transport via Pi. aiipython `/login` and `/auth`
+> commands are still backed by aiipython's Python auth manager.
+
+Pi gateway architecture details: [`docs/pi-lm-gateway.md`](docs/pi-lm-gateway.md)
 
 ## Commands
 
 | Command | Description |
 |---|---|
-| `/model` | Interactive model picker menu (live discovery + recents + TabMinion) |
+| `/model` | Show discovered models (live discovery + recents + TabMinion) |
 | `/model refresh` | Force-refresh live model discovery |
 | `/model <provider/name>` | Switch model directly |
 | `/image <path>` | Load image into `images` dict |
-| `/login` | Interactive login provider menu |
+| `/login` | Show login usage/options |
 | `/login anthropic` | OAuth login (Claude Pro/Max subscription) |
 | `/login openai` | OAuth login (ChatGPT Plus/Pro via Codex OAuth; Pi-compatible token import/login) |
 | `/login <provider> <api_key>` | Persist API key in `~/.aiipython/auth.json` (e.g. `openai`, `gemini`) |
@@ -40,6 +100,14 @@ In [7]: chat("openai/gpt-4o-mini")     # switch model
 | `/undo` | Revert AI's last turn (restore pre-turn snapshot) |
 | `/restore <id>` | Jump to any checkpoint by id |
 | `/fork [label]` | Mark a named branch point |
+
+### Input shortcuts
+
+- `!command` — run as IPython input in the bound aiipython session
+- `!!command` — same as `!command` (also routed as IPython input)
+- Model code fences:
+  - ` ```py ` (or ` ```python `) runs
+  - ` ```#py ` is reference-only (displayed, not executed)
 
 ## Checkpoints
 
@@ -56,9 +124,11 @@ Checkpoint tree:
 From IPython you can also use magics: `%tree`, `%undo`, `%restore 0003`,
 `%fork my experiment`.
 
-Sub-agents created with `spawn_agent()` receive a full clone of the
-parent's namespace — they can explore independently without affecting
-the main session.
+Sub-agents created with `spawn_agent()` now run in a **separate Python
+process** and receive a full clone of the parent's namespace. They can
+explore independently without affecting the main session. Keep the
+returned proxy (for example `child`) and call `child.react()` /
+`child.ask("next task")` to continue that same child statefully.
 
 Checkpoints are stored in `.aiipython_checkpoints/` (git-ignored by default).
 Large namespaces (big DataFrames, etc.) will produce proportionally larger
@@ -114,7 +184,7 @@ Example:
 /model openai-codex/gpt-5.3-codex
 ```
 
-## Remembered Model & Menus
+## Remembered Model
 
 aiipython remembers your last selected model in `~/.aiipython/settings.json`.
 On next launch, default resolution is:
@@ -124,10 +194,7 @@ On next launch, default resolution is:
 3. `AIIPYTHON_MODEL` environment variable
 4. fallback `gemini/gemini-3-flash-preview`
 
-`/model` and `/login` both open interactive numbered menus. Type a number,
-paste a value directly, or `q` to cancel.
-
-`/model` also performs live, auth-aware discovery (Anthropic/OpenAI/Gemini)
+`/model` performs live, auth-aware discovery (Anthropic/OpenAI/Gemini)
 plus TabMinion services when available, then caches results briefly for speed.
 Use `/model refresh` to force a rescan.
 
@@ -147,13 +214,22 @@ TabMinion drives the actual browser UI through a Firefox/Zen extension,
 so it uses your existing subscription. The footer shows
 `🔑 tabminion (browser)` when active.
 
+When using `tabminion/*` models, aiipython now sends
+`conversation_mode="new"` on every call (fresh browser conversation per turn)
+for more deterministic runs and less context bleed from prior chats.
+
 ## Environment variables
 
 | Variable | Default | Description |
 |---|---|---|
 | `AIIPYTHON_MODEL` | `gemini/gemini-3-flash-preview` | Default LM (used when no remembered model) |
+| `AIIPYTHON_UI` | `pi-native` | Frontend selection: `pi-native`, `pi-tui`, or `textual` |
+| `AIIPYTHON_UI_STRICT` | `0` | If `1`, fail instead of falling back to Textual when pi-tui startup fails |
+| `AIIPYTHON_LM_BACKEND` | `auto` | LM routing: `auto`, `pi`, or `litellm` |
 | `GEMINI_API_KEY` | — | Gemini key |
 | `OPENAI_API_KEY` | — | OpenAI key |
 | `ANTHROPIC_API_KEY` | — | Anthropic key |
-| `AIIPYTHON_INLINE` | `1` | Run Textual inline mode (`1/true/yes`) to preserve terminal-native transparency. Set `0/false/no` to force fullscreen alternate-screen mode |
-| `AIIPYTHON_BG` | auto-detected | Background color strategy. Accepts `ansi_default` or `#RRGGBB`. If unset, aiipython queries terminal background (OSC 11) and uses that color |
+| `TABMINION_WINDOW_ID` | — | Optional: force TabMinion OpenAI proxy to use a specific browser window ID |
+| `TABMINION_ACTIVATE` | `1` | Optional: set `0` to avoid tab activation/focus-stealing in TabMinion proxy |
+| `AIIPYTHON_INLINE` | `1` | Textual-only: run inline mode (`1/true/yes`) to preserve terminal-native transparency. Set `0/false/no` to force fullscreen alternate-screen mode |
+| `AIIPYTHON_BG` | auto-detected | Textual-only: background color strategy. Accepts `ansi_default` or `#RRGGBB` |

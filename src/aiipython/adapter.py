@@ -5,25 +5,24 @@ rewriting — what you see in the templates below is what the LM gets.
 
 Template elements
 ─────────────────
-  {instruction}           Signature docstring (optimizable by MIPRO/COPRO)
-  {session_summary()}     Custom helper: high-level timeline of the session
-                          (first 100 chars of each user msg, AI response,
-                          and code executed — lives in the system prompt so
-                          the model always has context on what's been done)
-  {agent_context()}       Custom helper: reads `agent_context` from the
-                          namespace.  The AI writes to this variable to
-                          persist notes, plans, and context across turns.
-  {pinned_context()}      Human-managed context refs (files/text) added via
-                          @mentions and /context; file refs are re-read live.
-  {environment_state}     The compact namespace + activity log from the kernel
-  {active_images()}       Custom helper: renders looked-at images inline
-                          (each becomes an image_url content block via DSPy's
-                          split_message_content_for_custom_types pipeline)
+  {instruction}             Signature docstring (optimizable by MIPRO/COPRO)
+  {latest_user_message()}   Guaranteed latest user message (full if small,
+                            head+tail when oversized)
+  {agent_context()}         Custom helper: reads `agent_context` from the
+                            namespace. The AI writes notes/plans here.
+  {pinned_context()}        Human-managed context refs (files/text) added via
+                            @mentions and /context; file refs are re-read live.
+  {recent_transcript()}     Budgeted transcript with user text + assistant prose
+                            (non-code markdown) for stronger continuity.
+  {environment_state}       Compact namespace + activity log from the kernel
+  {active_images()}         Custom helper: renders looked-at images inline
+                            (each becomes an image_url content block via DSPy's
+                            split_message_content_for_custom_types pipeline)
 
 Parse mode
 ──────────
   Custom callable `parse_markdown_response` — the entire LM completion
-  is returned as the `response` field.  Code block extraction is handled
+  is returned as the `response` field. Code block extraction is handled
   separately by aiipython.parser (not the adapter's job).
 """
 
@@ -34,6 +33,14 @@ from typing import TYPE_CHECKING, Any
 import dspy
 from dspy.signatures.signature import Signature
 from dspy_template_adapter import TemplateAdapter, Predict
+
+from aiipython.parser import strip_fenced_code
+from aiipython.prompt_policy import (
+    CLIPBOARD_INLINE_LIMIT,
+    LATEST_USER_FULL_LIMIT,
+    LATEST_USER_HEAD_TAIL,
+    TRANSCRIPT_BUDGET,
+)
 
 if TYPE_CHECKING:
     from aiipython.agent import ReactiveAgent
@@ -58,11 +65,14 @@ Multiple code blocks are executed in order.  IPython magic commands are supporte
 - `%%bash` — bash cell magic
 - `%timeit` — timing
 
+Use ` ```#py ` for reference-only code blocks that should **not** execute.
+
 ## Available Tools (in the IPython namespace)
 
 - `look_at(images["name"])` or `look_at(pil_img, "label")` — view an image
   (it will be included in your next call so you can see it)
-- `spawn_agent(task="...")` — create a sub-agent with its own IPython kernel
+- `spawn_agent(task="...")` — create a subprocess sub-agent proxy
+  (use `child.react()` or `child.ask("...")` to continue it statefully)
 - `print()` — inspect variable contents (the snapshot shows types/shapes only)
 
 ## Context Gardening
@@ -106,9 +116,9 @@ tree to undo, branch, and restore:
 If the user undoes your work and asks you to try again, check
 agent_context and the activity log to understand what was tried before.
 
-The session summary, agent_context, and pinned human context live in this
-system prompt. The namespace snapshot and recent activity live in the user
-message. You never see raw variable contents unless you print() them.
+Large pasted/clipboard payloads may be clipped for context budget.  If a
+payload appears clipped, inspect it strategically (head/tail/search/sampling)
+instead of dumping everything at once.
 
 ## Behavior
 
@@ -117,7 +127,7 @@ message. You never see raw variable contents unless you print() them.
 - The user's messages are in `user_inputs` (latest last) and `user_input`.
 - Update `agent_context` whenever your working context changes.
 - Treat pinned context as user-prioritized and keep it in mind.
-{agent_context()}{pinned_context()}{session_summary()}"""
+{latest_user_message()}{agent_context()}{pinned_context()}{recent_transcript()}"""
 
 USER_TEMPLATE = """\
 {environment_state}{active_images()}"""
@@ -161,12 +171,15 @@ print it.  To persist context across turns, write to `agent_context`."""
 
 # ── Helpers ─────────────────────────────────────────────────────────
 
-def _trunc(text: str, limit: int = 100) -> str:
-    """Truncate to *limit* chars, single line."""
-    text = text.replace("\n", " ").strip()
-    if len(text) <= limit:
+def _head_tail(text: str, *, head: int, tail: int) -> str:
+    if len(text) <= head + tail:
         return text
-    return text[:limit] + "…"
+    omitted = len(text) - head - tail
+    return (
+        f"{text[:head]}\n"
+        f"\n… [omitted {omitted} chars] …\n\n"
+        f"{text[-tail:]}"
+    )
 
 
 # ── Adapter factory ─────────────────────────────────────────────────
@@ -174,11 +187,12 @@ def _trunc(text: str, limit: int = 100) -> str:
 def build_adapter(agent: ReactiveAgent) -> TemplateAdapter:
     """Create a TemplateAdapter wired to *agent*'s live state.
 
-    Four custom helpers read from the agent at render time:
-      {agent_context()}    — the AI's own scratchpad (system prompt)
-      {pinned_context()}   — human-managed persistent refs (system prompt)
-      {session_summary()}  — high-level session timeline (system prompt)
-      {active_images()}    — multimodal image injection (user message)
+    Five custom helpers read from the agent at render time:
+      {latest_user_message()} — latest user message (system prompt)
+      {agent_context()}       — AI scratchpad (system prompt)
+      {pinned_context()}      — human-managed persistent refs (system prompt)
+      {recent_transcript()}   — budgeted transcript (system prompt)
+      {active_images()}       — multimodal image injection (user message)
     """
     adapter = TemplateAdapter(
         messages=[
@@ -188,9 +202,41 @@ def build_adapter(agent: ReactiveAgent) -> TemplateAdapter:
         parse_mode=parse_markdown_response,
     )
 
+    # ── helper: {latest_user_message()} ────────────────────────────
+    def latest_user_message_helper(
+        ctx: dict, signature: type[Signature], demos: list, **kwargs
+    ) -> str:
+        ns = agent.kernel.shell.user_ns
+        latest = ns.get("user_input") or ""
+        if not latest:
+            return ""
+
+        source = "chat"
+        is_clipboard = False
+        for entry in reversed(ns.get("conversation_log", [])):
+            if entry.get("role") == "user":
+                source = str(entry.get("source", "chat"))
+                is_clipboard = bool(entry.get("is_clipboard", False))
+                break
+
+        if len(latest) <= LATEST_USER_FULL_LIMIT:
+            body = latest
+        else:
+            body = _head_tail(
+                latest,
+                head=LATEST_USER_HEAD_TAIL,
+                tail=LATEST_USER_HEAD_TAIL,
+            )
+
+        return (
+            "\n## Latest User Message\n"
+            f"source: {source}{' (clipboard)' if is_clipboard else ''}\n"
+            "```text\n"
+            f"{body}\n"
+            "```\n"
+        )
+
     # ── helper: {agent_context()} ───────────────────────────────────
-    # Reads the `agent_context` variable from the namespace.  The AI
-    # writes to it from code; it appears in the system prompt.
     def agent_context_helper(
         ctx: dict, signature: type[Signature], demos: list, **kwargs
     ) -> str:
@@ -205,38 +251,70 @@ def build_adapter(agent: ReactiveAgent) -> TemplateAdapter:
     ) -> str:
         return agent.render_pinned_context()
 
-    # ── helper: {session_summary()} ─────────────────────────────────
-    def session_summary_helper(
+    # ── helper: {recent_transcript()} ───────────────────────────────
+    def recent_transcript_helper(
         ctx: dict, signature: type[Signature], demos: list, **kwargs
     ) -> str:
         ns = agent.kernel.shell.user_ns
-        user_inputs = ns.get("user_inputs", [])
-        ai_responses = ns.get("ai_responses", [])
-        history = agent.kernel.history
-
-        if not user_inputs and not ai_responses:
+        conv = ns.get("conversation_log", [])
+        if not conv:
             return ""
 
-        lines: list[str] = ["\n## Session Summary"]
+        rendered: list[str] = []
+        remaining = TRANSCRIPT_BUDGET
+        omitted = 0
 
-        ui_idx = 0
-        ar_idx = 0
+        for entry in reversed(conv):
+            role = entry.get("role")
+            title = ""
+            body = ""
 
-        for h in history:
-            tag = h.get("tag")
-            code = h.get("code", "")
+            if role == "user":
+                source = str(entry.get("source", "chat"))
+                is_clipboard = bool(entry.get("is_clipboard", False))
+                body = str(entry.get("text", ""))
+                if not body.strip():
+                    continue
+                if is_clipboard and len(body) > CLIPBOARD_INLINE_LIMIT:
+                    half = CLIPBOARD_INLINE_LIMIT // 2
+                    body = _head_tail(body, head=half, tail=half)
+                title = f"👤 user ({source}{', clipboard' if is_clipboard else ''})"
 
-            if tag == "user" and code.startswith("user_input = <message"):
-                if ui_idx < len(user_inputs):
-                    lines.append(f"  👤 {_trunc(user_inputs[ui_idx])}")
-                    ui_idx += 1
-            elif tag == "agent" and code.startswith("ai_responses += <response"):
-                if ar_idx < len(ai_responses):
-                    lines.append(f"  🤖 {_trunc(ai_responses[ar_idx])}")
-                    ar_idx += 1
-            elif tag == "agent" and not code.startswith("ai_responses"):
-                lines.append(f"  ⚡ {_trunc(code)}")
+            elif role == "assistant":
+                prose = str(entry.get("prose", "") or "").strip()
+                if not prose:
+                    prose = strip_fenced_code(str(entry.get("markdown", "")))
+                body = prose.strip()
+                if not body:
+                    continue
+                title = "🤖 assistant prose"
 
+            else:
+                continue
+
+            chunk = (
+                f"\n### {title}\n"
+                "```text\n"
+                f"{body}\n"
+                "```"
+            )
+
+            if len(chunk) > remaining:
+                omitted += 1
+                continue
+
+            rendered.append(chunk)
+            remaining -= len(chunk)
+
+        if not rendered:
+            return ""
+
+        rendered.reverse()
+
+        lines = ["\n## Recent Transcript (budgeted)"]
+        lines.extend(rendered)
+        if omitted > 0:
+            lines.append(f"\n… {omitted} older transcript entries omitted (budget cap).")
         return "\n".join(lines)
 
     # ── helper: {active_images()} ───────────────────────────────────
@@ -251,9 +329,10 @@ def build_adapter(agent: ReactiveAgent) -> TemplateAdapter:
             parts.append(f"\n[Image: {label}]\n{dspy_img}")
         return "\n".join(parts)
 
+    adapter.register_helper("latest_user_message", latest_user_message_helper)
     adapter.register_helper("agent_context", agent_context_helper)
     adapter.register_helper("pinned_context", pinned_context_helper)
-    adapter.register_helper("session_summary", session_summary_helper)
+    adapter.register_helper("recent_transcript", recent_transcript_helper)
     adapter.register_helper("active_images", active_images_helper)
 
     return adapter

@@ -7,7 +7,7 @@ from typing import Any, Callable
 
 import dspy
 
-from aiipython.checkpoint import clone_state, load_clone
+from aiipython.checkpoint import clone_state
 from aiipython.context import (
     add_file_item,
     add_text_item,
@@ -18,7 +18,11 @@ from aiipython.context import (
     render_for_prompt,
 )
 from aiipython.kernel import Kernel
-from aiipython.parser import CodeBlock, executable_blocks
+from aiipython.parser import CodeBlock, executable_blocks, strip_fenced_code
+from aiipython.prompt_policy import (
+    TURN_TRACE_BUDGET,
+    EXEC_OUTPUT_PER_BLOCK_LIMIT,
+)
 
 
 @dataclass
@@ -30,6 +34,10 @@ class ReactionStep:
     blocks: list[CodeBlock]
     executions: list[dict[str, Any]]
     is_final: bool
+
+
+class PromptAborted(RuntimeError):
+    """Raised when a reactive turn is cancelled by the user."""
 
 
 class ReactiveAgent:
@@ -150,7 +158,11 @@ class ReactiveAgent:
         return render_for_prompt(self.kernel.shell.user_ns)
 
     # ── build the compact environment state ─────────────────────────
-    def build_environment_state(self) -> str:
+    def build_environment_state(
+        self,
+        *,
+        turn_trace: list[dict[str, Any]] | None = None,
+    ) -> str:
         snap = self.kernel.snapshot()
         history = self.kernel.history
 
@@ -198,6 +210,59 @@ class ReactiveAgent:
                     src = txt[:60] + ("…" if len(txt) > 60 else "")
                 ctx_lines.append(f"  [{item_id}] {kind} {label} — {src}")
             sections.append("## Pinned Context Refs\n" + "\n".join(ctx_lines))
+
+        # ── current reactive-turn trace ─────────────────────────────
+        if turn_trace:
+            lines: list[str] = [
+                "## Current Turn Trace (code/results this reactive turn)",
+            ]
+            remaining = TURN_TRACE_BUDGET
+
+            for idx, t in enumerate(turn_trace, start=1):
+                if remaining <= 0:
+                    break
+
+                code = self._clip_text(
+                    t.get("code", ""),
+                    limit=min(EXEC_OUTPUT_PER_BLOCK_LIMIT, remaining),
+                )
+                lines.append(f"\n### step {idx} (iteration {t.get('iteration', '?')})")
+                lines.append("```py")
+                lines.append(code)
+                lines.append("```")
+                remaining -= len(code)
+
+                for label, key in [
+                    ("stdout", "stdout"),
+                    ("stderr", "stderr"),
+                    ("result", "result"),
+                    ("error", "error"),
+                ]:
+                    val = str(t.get(key, "") or "").strip()
+                    if not val or remaining <= 0:
+                        continue
+                    clipped = self._clip_text(
+                        val,
+                        limit=min(EXEC_OUTPUT_PER_BLOCK_LIMIT, remaining),
+                    )
+                    lines.append(f"{label}:")
+                    lines.append("```text")
+                    lines.append(clipped)
+                    lines.append("```")
+                    remaining -= len(clipped)
+
+                if t.get("truncated"):
+                    lines.append(
+                        "⚠ output/code was truncated for context budget. "
+                        "If needed, inspect targeted slices with print()."
+                    )
+
+            if remaining <= 0 and len(turn_trace) > 0:
+                lines.append(
+                    "\n… older steps omitted due to turn-trace budget."
+                )
+
+            sections.append("\n".join(lines))
 
         # ── compact activity log ────────────────────────────────────
         # Only metadata: what happened and whether it worked.
@@ -248,6 +313,93 @@ class ReactiveAgent:
 
         return "\n\n".join(sections)
 
+    @staticmethod
+    def _clip_text(text: str, *, limit: int) -> str:
+        if limit <= 0:
+            return ""
+        if len(text) <= limit:
+            return text
+        return f"{text[:limit]}\n… [{len(text) - limit} more chars]"
+
+    def _predict_response_markdown(
+        self,
+        *,
+        environment_state: str,
+        on_stream_chunk: Callable[[str, bool], None] | None = None,
+        should_abort: Callable[[], bool] | None = None,
+    ) -> str:
+        """Run one Predict call and return markdown, optionally streaming chunks."""
+        if should_abort and should_abort():
+            raise PromptAborted("Prompt aborted")
+
+        if on_stream_chunk is None:
+            prediction = self.predict(environment_state=environment_state)
+            return str(getattr(prediction, "response", "") or "")
+
+        def _extract_delta_text(item: Any) -> str:
+            if isinstance(item, bytes):
+                try:
+                    return item.decode("utf-8", errors="ignore")
+                except Exception:
+                    return ""
+            if isinstance(item, str):
+                return item
+
+            try:
+                choices = getattr(item, "choices", None)
+                if not choices:
+                    return ""
+                first = choices[0]
+                delta = getattr(first, "delta", None)
+                if delta is None and isinstance(first, dict):
+                    delta = first.get("delta")
+                if isinstance(delta, dict):
+                    return str(delta.get("content", "") or "")
+                return str(getattr(delta, "content", "") or "")
+            except Exception:
+                return ""
+
+        try:
+            from dspy.streaming import streamify
+
+            stream_predict = streamify(
+                self.predict,
+                stream_listeners=[],
+                include_final_prediction_in_output_stream=True,
+                async_streaming=False,
+            )
+
+            prediction = None
+            streamed_parts: list[str] = []
+
+            for item in stream_predict(environment_state=environment_state):
+                if should_abort and should_abort():
+                    raise PromptAborted("Prompt aborted")
+
+                if isinstance(item, dspy.Prediction):
+                    prediction = item
+                    continue
+
+                chunk = _extract_delta_text(item)
+                if chunk:
+                    streamed_parts.append(chunk)
+                    on_stream_chunk(chunk, False)
+
+            if prediction is not None:
+                final_markdown = str(getattr(prediction, "response", "") or "")
+                if final_markdown:
+                    return final_markdown
+
+            return "".join(streamed_parts)
+
+        except PromptAborted:
+            raise
+        except Exception:
+            if should_abort and should_abort():
+                raise PromptAborted("Prompt aborted")
+            prediction = self.predict(environment_state=environment_state)
+            return str(getattr(prediction, "response", "") or "")
+
     # ── react loop ──────────────────────────────────────────────────
     MAX_ITERATIONS = 5
 
@@ -255,6 +407,8 @@ class ReactiveAgent:
         self,
         on_response: Callable[[str], None] | None = None,
         on_step: Callable[[ReactionStep], None] | None = None,
+        on_stream_chunk: Callable[[str, bool], None] | None = None,
+        should_abort: Callable[[], bool] | None = None,
     ) -> list[str]:
         """React loop: run the LM, execute code, re-trigger if code ran.
 
@@ -278,24 +432,51 @@ class ReactiveAgent:
                 self.kernel, agent=self, label=ckpt_label,
             )
 
+        turn_trace: list[dict[str, Any]] = []
+
         for i in range(self.MAX_ITERATIONS):
-            env_state = self.build_environment_state()
+            if should_abort and should_abort():
+                raise PromptAborted("Prompt aborted")
 
-            prediction = self.predict(
+            env_state = self.build_environment_state(turn_trace=turn_trace)
+
+            markdown = self._predict_response_markdown(
                 environment_state=env_state,
+                on_stream_chunk=on_stream_chunk,
+                should_abort=should_abort,
             )
-
-            markdown: str = prediction.response
             responses.append(markdown)
 
             # Execute every runnable code block before the next model turn.
             blocks = executable_blocks(markdown)
             executions: list[dict[str, Any]] = []
             for block in blocks:
-                executions.append(self.kernel.execute(block.code, tag="agent"))
+                if should_abort and should_abort():
+                    raise PromptAborted("Prompt aborted")
+                entry = self.kernel.execute(block.code, tag="agent")
+                executions.append(entry)
+                turn_trace.append(
+                    {
+                        "iteration": i + 1,
+                        "code": block.code,
+                        "stdout": entry.get("stdout", ""),
+                        "stderr": entry.get("stderr", ""),
+                        "result": entry.get("result", ""),
+                        "error": entry.get("error", ""),
+                        "success": entry.get("success", True),
+                        "truncated": any(
+                            len(str(entry.get(k, "") or ""))
+                            > EXEC_OUTPUT_PER_BLOCK_LIMIT
+                            for k in ("stdout", "stderr", "result", "error")
+                        ) or len(block.code) > EXEC_OUTPUT_PER_BLOCK_LIMIT,
+                    }
+                )
 
             # Store the response in the namespace
-            self.kernel.push_ai_response(markdown)
+            self.kernel.push_ai_response(
+                markdown,
+                prose=strip_fenced_code(markdown),
+            )
 
             step = ReactionStep(
                 iteration=i,
@@ -316,17 +497,18 @@ class ReactiveAgent:
         return responses
 
     # ── spawn ───────────────────────────────────────────────────────
-    def spawn(self, task: str | None = None) -> "ReactiveAgent":
-        """Create a child agent with a *cloned* copy of the current state.
+    def spawn(self, task: str | None = None) -> Any:
+        """Create a subprocess child agent with a cloned copy of state.
 
-        The child gets its own kernel with a snapshot of the parent's
-        namespace, history, and active images.  Changes in the child
-        do not affect the parent.
+        Returns a ``SubprocessAgentProxy``. The child runs in a dedicated
+        Python process with its own IPython shell, namespace, and history.
+        Changes in the child never affect the parent process.
         """
         blob = clone_state(self.kernel, agent=self)
-        child_kernel = Kernel(enable_checkpoints=False)
-        child = ReactiveAgent(child_kernel)
-        load_clone(child_kernel, blob, agent=child)
-        if task:
-            child.kernel.push_user_input(task)
-        return child
+
+        lm = getattr(dspy.settings, "lm", None)
+        model = getattr(lm, "model", None) or "gemini/gemini-3-flash-preview"
+
+        from aiipython.subprocess_agent import SubprocessAgentProxy
+
+        return SubprocessAgentProxy(state_blob=blob, task=task, model=model)

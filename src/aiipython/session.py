@@ -17,6 +17,7 @@ from aiipython.kernel import Kernel
 from aiipython.agent import ReactiveAgent
 from aiipython.settings import get_settings
 from aiipython.wire import get_wire_log, WireLog
+from aiipython.wire_bridge import attach_traffic_bridge
 
 
 class Session:
@@ -26,6 +27,7 @@ class Session:
         self.kernel = kernel
         self.agent = ReactiveAgent(kernel)
         self.wire_log = get_wire_log()
+        attach_traffic_bridge(self.wire_log)
         self.model: str = getattr(dspy.settings, "lm", None) and dspy.settings.lm.model or "?"
         self.auth_source: AuthSource | None = self._resolve_auth()
 
@@ -46,19 +48,12 @@ class Session:
         os.environ["AIIPYTHON_MODEL"] = model
         os.environ["PYCODE_MODEL"] = model
 
-        from aiipython.streaming_lm import StreamingLM
-        from aiipython.tabminion import is_tabminion_model, litellm_model_kwargs
+        from aiipython.lm_factory import create_lm
+        from aiipython.tabminion import is_tabminion_model
+
+        lm = create_lm(model)
 
         if is_tabminion_model(model):
-            # Route through TabMinion browser bridge
-            tm_kwargs = litellm_model_kwargs(model)
-            lm = StreamingLM(
-                tm_kwargs.pop("model"),
-                api_base=tm_kwargs.pop("api_base"),
-                api_key=tm_kwargs.pop("api_key"),
-                cache=False,
-                **tm_kwargs,  # includes TabMinion extras (e.g. conversation_mode="new")
-            )
             # TabMinion = browser subscription, always free
             self.auth_source = AuthSource(
                 key="browser-session",
@@ -67,11 +62,25 @@ class Session:
                 is_subscription=True,
             )
         else:
-            # Re-resolve auth for the new model's provider
+            # Re-resolve auth for the current provider (env injection for legacy paths)
             self.auth_source = self._resolve_auth()
-            lm = StreamingLM(model, cache=False)
 
-        dspy.configure(lm=lm)
+        try:
+            dspy.configure(lm=lm)
+        except RuntimeError as exc:
+            if "can only be changed by the thread that initially configured it" not in str(exc):
+                raise
+            # aiipython may route model changes from a worker/RPC thread.
+            # Reset DSPy config ownership and retry in the current thread.
+            try:
+                import importlib
+
+                _settings_mod = importlib.import_module("dspy.dsp.utils.settings")
+                _settings_mod.config_owner_thread_id = None
+                _settings_mod.config_owner_async_task = None
+            except Exception:
+                pass
+            dspy.configure(lm=lm)
 
         # Rebuild the predict module with the new LM
         from aiipython.adapter import build_predict

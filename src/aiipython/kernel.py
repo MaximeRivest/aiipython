@@ -54,6 +54,8 @@ class Kernel:
             ns["images"] = {}
         if "ai_responses" not in ns:
             ns["ai_responses"] = []
+        if "conversation_log" not in ns:
+            ns["conversation_log"] = []
         if "agent_context" not in ns:
             ns["agent_context"] = ""
 
@@ -101,10 +103,26 @@ class Kernel:
         """Inject variables into the IPython namespace (no history trace)."""
         self.shell.push(kwargs)
 
-    def push_user_input(self, text: str) -> None:
-        """Store a user message — metadata only in history."""
-        self.shell.user_ns["user_input"] = text
-        self.shell.user_ns["user_inputs"].append(text)
+    def push_user_input(
+        self,
+        text: str,
+        *,
+        source: str = "chat",
+        is_clipboard: bool = False,
+    ) -> None:
+        """Store a user message and append it to the conversation log."""
+        ns = self.shell.user_ns
+        ns["user_input"] = text
+        ns.setdefault("user_inputs", []).append(text)
+        ns.setdefault("conversation_log", []).append(
+            {
+                "role": "user",
+                "text": text,
+                "source": source,
+                "is_clipboard": bool(is_clipboard),
+                "ts": datetime.now(timezone.utc).isoformat(),
+            }
+        )
         self._record(
             code=f"user_input = <message, {len(text)} chars>",
             tag="user",
@@ -121,9 +139,18 @@ class Kernel:
             tag="user",
         )
 
-    def push_ai_response(self, text: str) -> None:
-        """Store an AI response."""
-        self.shell.user_ns["ai_responses"].append(text)
+    def push_ai_response(self, text: str, *, prose: str | None = None) -> None:
+        """Store an AI response and append it to the conversation log."""
+        ns = self.shell.user_ns
+        ns.setdefault("ai_responses", []).append(text)
+        ns.setdefault("conversation_log", []).append(
+            {
+                "role": "assistant",
+                "markdown": text,
+                "prose": prose if prose is not None else "",
+                "ts": datetime.now(timezone.utc).isoformat(),
+            }
+        )
         self._record(
             code=f"ai_responses += <response, {len(text)} chars>",
             tag="agent",

@@ -6,6 +6,7 @@ Designed to be fast, best-effort, and safe to call frequently.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Callable
 
@@ -111,11 +112,76 @@ def _discover_gemini_models(api_key: str, timeout: float, limit: int) -> list[st
     return values[:limit]
 
 
+def _discover_via_pi_gateway(per_provider_limit: int = 10) -> dict[str, ProviderCatalog] | None:
+    """Discover models through the Node Pi gateway (best effort)."""
+    client = None
+    try:
+        from aiipython.pi_gateway_client import PiGatewayClient
+
+        client = PiGatewayClient()
+        models = client.list_models()
+        auth = client.auth_status()
+    except Exception:
+        return None
+    finally:
+        if client is not None:
+            try:
+                client.close()
+            except Exception:
+                pass
+
+    source_by_provider: dict[str, str | None] = {}
+    for row in auth.get("providers", []):
+        provider = row.get("provider")
+        source = row.get("source")
+        if isinstance(provider, str):
+            if source == "oauth":
+                source_by_provider[provider] = "oauth"
+            elif source == "api_key":
+                source_by_provider[provider] = "auth.json"
+            elif source == "env":
+                source_by_provider[provider] = "env"
+            else:
+                source_by_provider.setdefault(provider, None)
+
+    grouped: dict[str, list[str]] = {"anthropic": [], "openai": [], "gemini": []}
+    for m in models:
+        provider = m.get("provider")
+        model_id = m.get("id")
+        available = bool(m.get("available", False))
+        if provider not in grouped:
+            continue
+        if not isinstance(model_id, str):
+            continue
+        if not available:
+            continue
+        grouped[provider].append(model_id)
+
+    out: dict[str, ProviderCatalog] = {}
+    for provider in ("anthropic", "openai", "gemini"):
+        uniq = list(dict.fromkeys(grouped.get(provider, [])))[:per_provider_limit]
+        src = source_by_provider.get(provider)
+        if uniq:
+            out[provider] = ProviderCatalog(provider=provider, source=src or "configured", models=uniq, error=None)
+        elif src:
+            out[provider] = ProviderCatalog(provider=provider, source=src, models=[], error="no-models")
+        else:
+            out[provider] = ProviderCatalog(provider=provider, source=None, models=[], error="no-auth")
+
+    return out
+
+
 def discover_provider_catalog(timeout: float = 2.0, per_provider_limit: int = 10) -> dict[str, ProviderCatalog]:
     """Discover available models for configured providers.
 
     Best effort: network/auth errors are captured in ``error`` and do not raise.
     """
+    backend = (os.environ.get("AIIPYTHON_LM_BACKEND") or "auto").strip().lower()
+    if backend in {"pi", "auto"}:
+        via_pi = _discover_via_pi_gateway(per_provider_limit=per_provider_limit)
+        if via_pi is not None:
+            return via_pi
+
     auth = get_auth_manager()
     results: dict[str, ProviderCatalog] = {}
 

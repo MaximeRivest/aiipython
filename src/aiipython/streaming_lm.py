@@ -188,6 +188,16 @@ class StreamingLM(dspy.LM):
         }
         finish_reason = "stop"
 
+        send_stream = getattr(dspy.settings, "send_stream", None)
+        stream_sender = None
+        if send_stream is not None:
+            try:
+                from dspy.streaming.messages import sync_send_to_stream
+
+                stream_sender = sync_send_to_stream
+            except Exception:
+                stream_sender = None
+
         with httpx.stream(
             "POST",
             _CODEX_BASE_URL,
@@ -223,7 +233,13 @@ class StreamingLM(dspy.LM):
                     raise RuntimeError(f"Codex error: {msg}")
 
                 if etype == "response.output_text.delta":
-                    full_text += str(event.get("delta", ""))
+                    delta_text = str(event.get("delta", ""))
+                    full_text += delta_text
+                    if stream_sender is not None and delta_text:
+                        try:
+                            stream_sender(send_stream, delta_text)
+                        except Exception:
+                            pass
                     continue
 
                 if etype in {"response.completed", "response.done"}:
@@ -318,8 +334,23 @@ class StreamingLM(dspy.LM):
         )
 
         chunks = []
+        send_stream = getattr(dspy.settings, "send_stream", None)
+        stream_sender = None
+        if send_stream is not None:
+            try:
+                from dspy.streaming.messages import sync_send_to_stream
+
+                stream_sender = sync_send_to_stream
+            except Exception:
+                stream_sender = None
+
         for chunk in response:
             chunks.append(chunk)
+            if stream_sender is not None:
+                try:
+                    stream_sender(send_stream, chunk)
+                except Exception:
+                    pass
 
         result = litellm.stream_chunk_builder(chunks)
 

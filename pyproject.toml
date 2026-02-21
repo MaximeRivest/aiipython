@@ -1,9 +1,9 @@
 [project]
 name = "aiipython"
-version = "0.2.3"
+version = "0.5.0"
 description = "A reactive AI chat assistant running inside IPython"
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.10"
 dependencies = [
     "textual>=3.0",
     "dspy>=2.6",
@@ -24,3 +24,14 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/aiipython"]
+include = [
+    "src/aiipython/pi_tui_frontend/package.json",
+    "src/aiipython/pi_tui_frontend/package-lock.json",
+    "src/aiipython/pi_tui_frontend/pi_tui_app.mjs",
+    "src/aiipython/pi_gateway/package.json",
+    "src/aiipython/pi_gateway/package-lock.json",
+    "src/aiipython/pi_gateway/pi_gateway_server.mjs",
+    "src/aiipython/pi_native_host/package.json",
+    "src/aiipython/pi_native_host/package-lock.json",
+    "src/aiipython/pi_native_host/pi_native_host.mjs",
+]

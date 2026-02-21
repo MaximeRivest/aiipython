@@ -9,5 +9,10 @@ wheels/
 # Virtual environments
 .venv
 
+# Node frontend dependencies
+src/aiipython/pi_tui_frontend/node_modules/
+src/aiipython/pi_gateway/node_modules/
+src/aiipython/pi_native_host/node_modules/
+
 # Checkpoint snapshots
 .aiipython_checkpoints/
