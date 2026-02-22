@@ -16,8 +16,6 @@ from aiipython.auth import AuthSource, get_auth_manager, ENV_KEY_MAP
 from aiipython.kernel import Kernel
 from aiipython.agent import ReactiveAgent
 from aiipython.settings import get_settings
-from aiipython.wire import get_wire_log, WireLog
-from aiipython.wire_bridge import attach_traffic_bridge
 
 
 class Session:
@@ -26,8 +24,6 @@ class Session:
     def __init__(self, kernel: Kernel) -> None:
         self.kernel = kernel
         self.agent = ReactiveAgent(kernel)
-        self.wire_log = get_wire_log()
-        attach_traffic_bridge(self.wire_log)
         self.model: str = getattr(dspy.settings, "lm", None) and dspy.settings.lm.model or "?"
         self.auth_source: AuthSource | None = self._resolve_auth()
 
@@ -49,21 +45,11 @@ class Session:
         os.environ["PYCODE_MODEL"] = model
 
         from aiipython.lm_factory import create_lm
-        from aiipython.tabminion import is_tabminion_model
+        from aiipython.mlflow_integration import configure_mlflow_from_env
 
+        configure_mlflow_from_env()
         lm = create_lm(model)
-
-        if is_tabminion_model(model):
-            # TabMinion = browser subscription, always free
-            self.auth_source = AuthSource(
-                key="browser-session",
-                source="tabminion (browser)",
-                provider=model.split("/", 1)[1] if "/" in model else model,
-                is_subscription=True,
-            )
-        else:
-            # Re-resolve auth for the current provider (env injection for legacy paths)
-            self.auth_source = self._resolve_auth()
+        self.auth_source = self._resolve_auth()
 
         try:
             dspy.configure(lm=lm)

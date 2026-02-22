@@ -17,20 +17,9 @@ def _configure_worker_lm(model: str) -> None:
     """Configure dspy LM inside the child process to match parent model."""
     import dspy
 
-    from aiipython.streaming_lm import StreamingLM
-    from aiipython.tabminion import is_tabminion_model, litellm_model_kwargs
+    from aiipython.lm_factory import create_lm
 
-    if is_tabminion_model(model):
-        tm_kwargs = litellm_model_kwargs(model)
-        lm = StreamingLM(
-            tm_kwargs.pop("model"),
-            api_base=tm_kwargs.pop("api_base"),
-            api_key=tm_kwargs.pop("api_key"),
-            cache=False,
-            **tm_kwargs,
-        )
-    else:
-        lm = StreamingLM(model, cache=False)
+    lm = create_lm(model)
 
     dspy.configure(lm=lm)
 

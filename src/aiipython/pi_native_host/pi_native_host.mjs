@@ -1,4 +1,6 @@
+import fs from "node:fs/promises";
 import net from "node:net";
+import path from "node:path";
 import process from "node:process";
 
 import { Type } from "@sinclair/typebox";
@@ -565,6 +567,134 @@ function createAiipythonUserBashExtension(rpc) {
     return s.length <= max ? s : `${s.slice(0, max - 1)}…`;
   };
 
+  const PIN_FILE_SCAN_MAX = 5000;
+  const PIN_FILE_DEPTH_MAX = 8;
+  const PIN_SKIP_DIRS = new Set([
+    ".git",
+    "node_modules",
+    ".venv",
+    "dist",
+    "build",
+    ".cache",
+    "__pycache__",
+    ".aiipython_checkpoints",
+  ]);
+
+  const scanProjectFiles = async () => {
+    const root = process.cwd();
+    const out = [];
+    const stack = [{ dir: root, depth: 0 }];
+
+    while (stack.length > 0 && out.length < PIN_FILE_SCAN_MAX) {
+      const { dir, depth } = stack.pop();
+      let entries = [];
+      try {
+        entries = await fs.readdir(dir, { withFileTypes: true });
+      } catch {
+        continue;
+      }
+
+      entries.sort((a, b) => a.name.localeCompare(b.name));
+
+      for (const ent of entries) {
+        if (out.length >= PIN_FILE_SCAN_MAX) break;
+
+        const abs = path.join(dir, ent.name);
+        if (ent.isDirectory()) {
+          if (depth >= PIN_FILE_DEPTH_MAX) continue;
+          if (PIN_SKIP_DIRS.has(ent.name)) continue;
+          stack.push({ dir: abs, depth: depth + 1 });
+          continue;
+        }
+
+        if (!ent.isFile()) continue;
+
+        const rel = path.relative(root, abs).split(path.sep).join("/");
+        out.push({
+          abs,
+          rel,
+          name: ent.name,
+          ext: path.extname(ent.name).toLowerCase(),
+        });
+      }
+    }
+
+    out.sort((a, b) => a.rel.localeCompare(b.rel));
+    return out;
+  };
+
+  const parsePinFilters = (rawArgs) => {
+    const raw = String(rawArgs || "").trim();
+    const tokens = raw ? raw.split(/\s+/).filter(Boolean) : [];
+
+    const extFilters = new Set();
+    let pathFilter = "";
+    const freeTerms = [];
+
+    for (let i = 0; i < tokens.length; i++) {
+      const t = tokens[i];
+      if (t === "--ext" || t === "-e") {
+        const v = String(tokens[i + 1] || "").trim();
+        if (v) {
+          i += 1;
+          for (const part of v.split(",")) {
+            const p = part.trim().toLowerCase();
+            if (!p) continue;
+            extFilters.add(p.startsWith(".") ? p : `.${p}`);
+          }
+        }
+        continue;
+      }
+      if (t.startsWith("--ext=")) {
+        const rhs = t.slice("--ext=".length).trim();
+        for (const part of rhs.split(",")) {
+          const p = part.trim().toLowerCase();
+          if (!p) continue;
+          extFilters.add(p.startsWith(".") ? p : `.${p}`);
+        }
+        continue;
+      }
+      if (t === "--path" || t === "-p") {
+        const v = String(tokens[i + 1] || "").trim();
+        if (v) {
+          i += 1;
+          pathFilter = v.toLowerCase();
+        }
+        continue;
+      }
+      if (t.startsWith("--path=")) {
+        pathFilter = t.slice("--path=".length).trim().toLowerCase();
+        continue;
+      }
+      freeTerms.push(t);
+    }
+
+    return {
+      query: freeTerms.join(" ").trim().toLowerCase(),
+      extFilters,
+      pathFilter,
+    };
+  };
+
+  const applyPinFilters = (files, filters) => {
+    const queryTerms = String(filters?.query || "")
+      .split(/\s+/)
+      .map((t) => t.trim())
+      .filter(Boolean);
+
+    return files.filter((file) => {
+      const rel = String(file?.rel || "").toLowerCase();
+      const name = String(file?.name || "").toLowerCase();
+      const ext = String(file?.ext || "").toLowerCase();
+      const bag = `${rel} ${name} ${ext}`;
+
+      if (filters?.extFilters?.size > 0 && !filters.extFilters.has(ext)) return false;
+      if (filters?.pathFilter && !rel.includes(filters.pathFilter)) return false;
+      if (queryTerms.length > 0 && !queryTerms.every((t) => bag.includes(t))) return false;
+      return true;
+    });
+  };
+
   return (pi) => {
     pi.on("input", async (event, ctx) => {
       if (event?.source === "extension") {
@@ -635,6 +765,387 @@ function createAiipythonUserBashExtension(rpc) {
           `IPython variables${query ? ` (filter: ${query})` : ""} • ${entries.length}`,
           options,
         );
+      },
+    });
+
+    pi.registerCommand("mlflow", {
+      description: "Manage MLflow UI for DSPy traces (/mlflow start|status|stop)",
+      handler: async (args, ctx) => {
+        const tokens = String(args || "")
+          .trim()
+          .split(/\s+/)
+          .filter(Boolean);
+
+        let action = "start";
+        if (tokens.length > 0) {
+          const head = String(tokens[0] || "").toLowerCase();
+          if (["start", "status", "stop", "help"].includes(head)) {
+            action = head;
+            tokens.shift();
+          }
+        }
+
+        if (action === "help") {
+          ctx.ui.notify("Usage: /mlflow [start|status|stop] [--host 127.0.0.1] [--port 5000] [--no-open]", "info");
+          return;
+        }
+
+        if (action === "status") {
+          const status = await rpc.request("mlflow_status", {});
+          const tracking = String(status?.tracking_uri || "");
+          const experiment = String(status?.experiment || "aiipython");
+          const running = Boolean(status?.ui_running);
+          const url = String(status?.ui_url || "");
+
+          ctx.ui.notify(`MLflow tracing: ${status?.enabled ? "enabled" : "disabled"}`, "info");
+          ctx.ui.notify(`Tracking: ${tracking}`, "info");
+          ctx.ui.notify(`Experiment: ${experiment}`, "info");
+          if (running && url) {
+            ctx.ui.notify(`UI running at ${url}`, "info");
+          } else {
+            ctx.ui.notify("UI is not running. Start with /mlflow", "warning");
+          }
+          return;
+        }
+
+        if (action === "stop") {
+          const stopped = await rpc.request("mlflow_stop", {});
+          if (stopped?.was_running) {
+            ctx.ui.notify("Stopped MLflow UI.", "info");
+          } else {
+            ctx.ui.notify("MLflow UI was not running.", "warning");
+          }
+          return;
+        }
+
+        let host = "127.0.0.1";
+        let port = null;
+        let openBrowser = true;
+
+        for (let i = 0; i < tokens.length; i++) {
+          const t = tokens[i];
+          if (t === "--host") {
+            const v = String(tokens[i + 1] || "").trim();
+            if (v) {
+              host = v;
+              i += 1;
+            }
+            continue;
+          }
+          if (t.startsWith("--host=")) {
+            const v = t.slice("--host=".length).trim();
+            if (v) host = v;
+            continue;
+          }
+          if (t === "--port") {
+            const v = Number(tokens[i + 1]);
+            if (Number.isFinite(v)) {
+              port = Math.trunc(v);
+              i += 1;
+            }
+            continue;
+          }
+          if (t.startsWith("--port=")) {
+            const v = Number(t.slice("--port=".length));
+            if (Number.isFinite(v)) {
+              port = Math.trunc(v);
+            }
+            continue;
+          }
+          if (t === "--no-open") {
+            openBrowser = false;
+            continue;
+          }
+          if (t === "--open") {
+            openBrowser = true;
+          }
+        }
+
+        const result = await rpc.request("mlflow_start", {
+          host,
+          port,
+          open_browser: openBrowser,
+        });
+
+        const url = String(result?.ui_url || "");
+        const tracking = String(result?.tracking_uri || "");
+        const experiment = String(result?.experiment || "aiipython");
+
+        if (result?.already_running) {
+          ctx.ui.notify(`MLflow UI already running at ${url}`, "info");
+        } else {
+          ctx.ui.notify(`Started MLflow UI at ${url}`, "info");
+        }
+        if (result?.browser_opened) {
+          ctx.ui.notify("Opened MLflow UI in your browser.", "info");
+        } else {
+          ctx.ui.notify(`Open this URL: ${url}`, "info");
+        }
+        if (tracking) ctx.ui.notify(`Tracking: ${tracking}`, "info");
+        if (experiment) ctx.ui.notify(`Experiment: ${experiment}`, "info");
+      },
+    });
+
+    pi.registerCommand("pin", {
+      description: "Interactively add files to pinned context (supports fuzzy/filter)",
+      handler: async (args, ctx) => {
+        const filters = parsePinFilters(args);
+
+        const addPath = async (filePath) => {
+          const resp = await rpc.request("add_pin", {
+            path: filePath,
+            source: "/pin",
+          });
+          const item = resp?.item || {};
+          return {
+            id: String(item?.id || ""),
+            relpath: String(item?.relpath || filePath),
+          };
+        };
+
+        let files = await scanProjectFiles();
+        if (files.length === 0) {
+          ctx.ui.notify("No files found in current project.", "warning");
+          return;
+        }
+
+        let filtered = applyPinFilters(files, filters);
+        if (filtered.length === 0) {
+          ctx.ui.notify("No files match current /pin filters.", "warning");
+          return;
+        }
+
+        const selected = new Set();
+        let addedCount = 0;
+
+        for (;;) {
+          const available = filtered.filter((f) => !selected.has(f.abs));
+          if (available.length === 0) break;
+
+          const shown = available.slice(0, 400);
+          const options = [
+            "[done] finish pinning",
+            "[refresh file list]",
+            ...shown.map((f, i) => `${String(i + 1).padStart(3, "0")} ${f.rel}`),
+          ];
+          if (available.length > shown.length) {
+            options.push(`… ${available.length - shown.length} more files (refine /pin query)`);
+          }
+
+          const picked = await ctx.ui.select(
+            `Pin files (matches: ${available.length}, added: ${addedCount})`,
+            options,
+          );
+
+          if (!picked || picked.startsWith("[done]")) break;
+
+          if (picked.startsWith("[refresh")) {
+            files = await scanProjectFiles();
+            filtered = applyPinFilters(files, filters);
+            continue;
+          }
+
+          if (picked.startsWith("… ")) {
+            ctx.ui.notify("Too many matches. Add a query or --path/--ext filter.", "warning");
+            continue;
+          }
+
+          const m = /^(\d{3})\s+/.exec(picked);
+          if (!m) continue;
+          const idx = Number(m[1]) - 1;
+          const row = shown[idx];
+          if (!row) continue;
+
+          try {
+            const pinned = await addPath(row.rel);
+            selected.add(row.abs);
+            addedCount += 1;
+            const idPart = pinned.id ? `\`${pinned.id}\` ` : "";
+            ctx.ui.notify(`Pinned ${idPart}${pinned.relpath}`, "info");
+          } catch (err) {
+            const message = err instanceof Error ? err.message : String(err);
+            ctx.ui.notify(`Failed to pin ${row.rel}: ${message}`, "warning");
+          }
+        }
+
+        if (addedCount > 0) {
+          ctx.ui.notify(`Added ${addedCount} file(s) to pinned context.`, "info");
+        }
+      },
+    });
+
+    pi.registerCommand("unpin", {
+      description: "Interactively remove pinned context items (supports fuzzy/filter/all)",
+      handler: async (args, ctx) => {
+        const raw = String(args || "").trim();
+
+        const tokens = raw ? raw.split(/\s+/).filter(Boolean) : [];
+        const idLike = tokens.filter((t) => /^ctx\d+$/i.test(t));
+        const extFilters = new Set();
+        let pathFilter = "";
+        let allFlag = false;
+        const freeTerms = [];
+
+        for (let i = 0; i < tokens.length; i++) {
+          const t = tokens[i];
+          if (t === "--all" || t === "-a") {
+            allFlag = true;
+            continue;
+          }
+          if (t === "--ext" || t === "-e") {
+            const v = String(tokens[i + 1] || "").trim();
+            if (v) {
+              i += 1;
+              for (const part of v.split(",")) {
+                const p = part.trim().toLowerCase();
+                if (!p) continue;
+                extFilters.add(p.startsWith(".") ? p : `.${p}`);
+              }
+            }
+            continue;
+          }
+          if (t.startsWith("--ext=")) {
+            const rhs = t.slice("--ext=".length).trim();
+            for (const part of rhs.split(",")) {
+              const p = part.trim().toLowerCase();
+              if (!p) continue;
+              extFilters.add(p.startsWith(".") ? p : `.${p}`);
+            }
+            continue;
+          }
+          if (t === "--path" || t === "-p") {
+            const v = String(tokens[i + 1] || "").trim();
+            if (v) {
+              i += 1;
+              pathFilter = v.toLowerCase();
+            }
+            continue;
+          }
+          if (t.startsWith("--path=")) {
+            pathFilter = t.slice("--path=".length).trim().toLowerCase();
+            continue;
+          }
+          freeTerms.push(t);
+        }
+
+        const query = freeTerms.join(" ").trim().toLowerCase();
+
+        const fetchItems = async () => {
+          const pins = await rpc.request("list_pins", { include_stats: true });
+          return Array.isArray(pins?.items) ? pins.items : [];
+        };
+
+        const applyFilters = (items) => {
+          return items.filter((item) => {
+            const ext = String(item?.ext || "").toLowerCase();
+            const path = String(item?.path || item?.relpath || item?.preview || "").toLowerCase();
+            const bag = [
+              String(item?.id || ""),
+              String(item?.kind || ""),
+              String(item?.label || ""),
+              String(item?.source || ""),
+              String(item?.relpath || ""),
+              String(item?.path || ""),
+              ext,
+            ]
+              .join(" ")
+              .toLowerCase();
+
+            if (extFilters.size > 0 && !extFilters.has(ext)) return false;
+            if (pathFilter && !path.includes(pathFilter)) return false;
+            if (query && !bag.includes(query)) return false;
+            return true;
+          });
+        };
+
+        const removeIds = async (ids) => {
+          let removed = 0;
+          let missing = 0;
+          for (const id of ids) {
+            const result = await rpc.request("remove_pin", { id });
+            if (result?.removed) removed += 1;
+            else missing += 1;
+          }
+          return { removed, missing };
+        };
+
+        // Fast path: explicit IDs only, no filters/query
+        const hasFilterOrQuery = extFilters.size > 0 || !!pathFilter || !!query || allFlag;
+        if (idLike.length > 0 && !hasFilterOrQuery && idLike.length === tokens.length) {
+          const { removed, missing } = await removeIds(idLike);
+          if (removed > 0) ctx.ui.notify(`Removed ${removed} pin(s)`, "info");
+          if (missing > 0) ctx.ui.notify(`${missing} pin id(s) not found`, "warning");
+          return;
+        }
+
+        let items = await fetchItems();
+        if (items.length === 0) {
+          ctx.ui.notify("No pinned context items.", "info");
+          return;
+        }
+
+        let filtered = applyFilters(items);
+        if (filtered.length === 0) {
+          ctx.ui.notify("No pinned items match current filters/query.", "warning");
+          return;
+        }
+
+        if (allFlag) {
+          const ids = filtered.map((it) => String(it?.id || "")).filter(Boolean);
+          const { removed, missing } = await removeIds(ids);
+          if (removed > 0) ctx.ui.notify(`Removed ${removed} matched pin(s)`, "info");
+          if (missing > 0) ctx.ui.notify(`${missing} matched pin(s) missing`, "warning");
+          return;
+        }
+
+        let removedCount = 0;
+        while (filtered.length > 0) {
+          const options = [
+            "[done] finish unpinning",
+            `[remove all ${filtered.length} current matches]`,
+            ...filtered.map((item) => {
+              const id = String(item?.id || "");
+              const kind = String(item?.kind || "text");
+              const label = String(item?.label || id);
+              const ext = String(item?.ext || "");
+              const lc = Number(item?.line_count);
+              const lines = Number.isFinite(lc) && lc >= 0 ? ` · ${lc}L` : "";
+              const where = String(item?.relpath || item?.path || item?.preview || item?.source || "");
+              return `${id} [${kind}] ${label}${ext ? ` ${ext}` : ""}${lines} — ${where}`;
+            }),
+          ];
+
+          const picked = await ctx.ui.select(
+            `Unpin (matches: ${filtered.length}, removed: ${removedCount})`,
+            options,
+          );
+          if (!picked || picked.startsWith("[done]")) break;
+
+          if (picked.startsWith("[remove all")) {
+            const ids = filtered.map((it) => String(it?.id || "")).filter(Boolean);
+            const { removed, missing } = await removeIds(ids);
+            removedCount += removed;
+            if (missing > 0) ctx.ui.notify(`${missing} match(es) already gone`, "warning");
+            break;
+          }
+
+          const pickedId = picked.split(" ", 1)[0];
+          if (!pickedId) break;
+
+          const result = await rpc.request("remove_pin", { id: pickedId });
+          if (result?.removed) {
+            removedCount += 1;
+          } else {
+            ctx.ui.notify(`No pin '${pickedId}' found`, "warning");
+          }
+
+          items = await fetchItems();
+          filtered = applyFilters(items);
+        }
+
+        if (removedCount > 0) {
+          ctx.ui.notify(`Removed ${removedCount} pin(s)`, "info");
+        }
       },
     });
 

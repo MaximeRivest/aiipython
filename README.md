@@ -13,6 +13,10 @@ uv run aiipython
 uv run aiipython -m openai/gpt-4o-mini
 # (after publish/install) uvx aiipython
 
+# Optional: enable MLflow DSPy tracing with defaults
+uv sync --extra mlflow
+uv run aiipython --mlflow
+
 # Optional: force LM routing through Pi model/auth stack
 AIIPYTHON_LM_BACKEND=pi uv run aiipython
 
@@ -96,6 +100,9 @@ Pi gateway architecture details: [`docs/pi-lm-gateway.md`](docs/pi-lm-gateway.md
 | `/logout <provider>` | Remove stored credentials |
 | `/auth` | Show auth sources and what's active |
 | `/tabminion` | Show TabMinion status and available browser AIs |
+| `/mlflow` | Start MLflow UI, auto-enable tracing, and open browser |
+| `/mlflow status` | Show MLflow tracing + UI status |
+| `/mlflow stop` | Stop the MLflow UI process |
 | `/tree` | Show checkpoint tree |
 | `/undo` | Revert AI's last turn (restore pre-turn snapshot) |
 | `/restore <id>` | Jump to any checkpoint by id |
@@ -226,6 +233,12 @@ for more deterministic runs and less context bleed from prior chats.
 | `AIIPYTHON_UI` | `pi-native` | Frontend selection: `pi-native`, `pi-tui`, or `textual` |
 | `AIIPYTHON_UI_STRICT` | `0` | If `1`, fail instead of falling back to Textual when pi-tui startup fails |
 | `AIIPYTHON_LM_BACKEND` | `auto` | LM routing: `auto`, `pi`, or `litellm` |
+| `AIIPYTHON_MLFLOW` | `0` | Set to `1` to enable `mlflow.dspy.autolog()` tracing |
+| `AIIPYTHON_MLFLOW_TRACKING_URI` | `sqlite:///$HOME/.aiipython/mlflow.db` | Optional MLflow tracking URI override |
+| `AIIPYTHON_MLFLOW_EXPERIMENT` | `aiipython` | Optional MLflow experiment name override |
+| `AIIPYTHON_MLFLOW_SILENT` | `0` | If `1`, suppress MLflow autologging warnings/events |
+| `AIIPYTHON_MLFLOW_AUTO_UI` | `1` | If `AIIPYTHON_MLFLOW=1`, auto-start MLflow UI on launch |
+| `AIIPYTHON_MLFLOW_OPEN_BROWSER` | `1` | Auto-open MLflow UI URL in your browser when starting UI |
 | `GEMINI_API_KEY` | — | Gemini key |
 | `OPENAI_API_KEY` | — | OpenAI key |
 | `ANTHROPIC_API_KEY` | — | Anthropic key |
@@ -233,3 +246,14 @@ for more deterministic runs and less context bleed from prior chats.
 | `TABMINION_ACTIVATE` | `1` | Optional: set `0` to avoid tab activation/focus-stealing in TabMinion proxy |
 | `AIIPYTHON_INLINE` | `1` | Textual-only: run inline mode (`1/true/yes`) to preserve terminal-native transparency. Set `0/false/no` to force fullscreen alternate-screen mode |
 | `AIIPYTHON_BG` | auto-detected | Textual-only: background color strategy. Accepts `ansi_default` or `#RRGGBB` |
+
+To enable MLflow tracing with defaults:
+
+```bash
+uv sync --extra mlflow
+uv run aiipython --mlflow
+```
+
+With `--mlflow`, aiipython now auto-starts the MLflow UI and attempts to open your browser.
+Inside pi-native, you can also run `/mlflow` (or `/mlflow --no-open`) and `/mlflow status`.
+(Equivalent to `AIIPYTHON_MLFLOW=1 uv run aiipython`.)

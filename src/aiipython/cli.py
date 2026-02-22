@@ -26,19 +26,22 @@ def main() -> None:
     parser.add_argument(
         "--ui",
         default=None,
-        choices=["pi-native", "pi-tui", "textual"],
-        help="Frontend UI: pi-native (default), pi-tui, or textual (legacy).",
+        choices=["pi-native"],
+        help="Frontend UI choice: pi-native.",
     )
     parser.add_argument(
-        "--lm-backend",
-        default=None,
-        choices=["auto", "pi", "litellm"],
-        help="LM backend routing: auto (default), pi gateway, or litellm.",
+        "--mlflow",
+        action="store_true",
+        help="Enable MLflow DSPy tracing (same as AIIPYTHON_MLFLOW=1).",
     )
     args = parser.parse_args()
 
     from aiipython import chat
-    chat(model=args.model, ui=args.ui, lm_backend=args.lm_backend)
+    chat(
+        model=args.model,
+        ui=args.ui,
+        mlflow=True if args.mlflow else None,
+    )
 
 
 if __name__ == "__main__":

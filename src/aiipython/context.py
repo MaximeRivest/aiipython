@@ -6,6 +6,7 @@ are checkpointed, and can be managed from both UI commands and the REPL.
 
 from __future__ import annotations
 
+import hashlib
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -98,18 +99,42 @@ def clear_items(ns: dict[str, Any]) -> int:
     return n
 
 
+def _env_int(name: str, default: int) -> int:
+    import os
+
+    raw = os.environ.get(name)
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        return int(str(raw).strip())
+    except Exception:
+        return default
+
+
 def render_for_prompt(
     ns: dict[str, Any],
     *,
-    max_items: int = 12,
-    max_item_chars: int = 2500,
-    max_total_chars: int = 12000,
+    max_items: int = 5_000,
+    max_item_chars: int = 250_000,
+    max_total_chars: int = 7_500_000,
 ) -> str:
-    """Render live context for interpolation into the system prompt."""
+    """Render live context for interpolation into the system prompt.
+
+    Runtime overrides (env vars):
+      - AIIPYTHON_PINNED_CONTEXT_MAX_ITEMS
+      - AIIPYTHON_PINNED_CONTEXT_MAX_ITEM_CHARS
+      - AIIPYTHON_PINNED_CONTEXT_MAX_TOTAL_CHARS (<=0 disables total cap)
+    """
     ensure_context_namespace(ns)
     items = ns[_CONTEXT_ITEMS_KEY]
     if not items:
         return ""
+
+    max_items = max(1, _env_int("AIIPYTHON_PINNED_CONTEXT_MAX_ITEMS", max_items))
+    max_item_chars = max(256, _env_int("AIIPYTHON_PINNED_CONTEXT_MAX_ITEM_CHARS", max_item_chars))
+    max_total_chars = _env_int("AIIPYTHON_PINNED_CONTEXT_MAX_TOTAL_CHARS", max_total_chars)
+    if max_total_chars <= 0:
+        max_total_chars = 10**9
 
     lines: list[str] = ["\n## Pinned Context (human-managed, live)"]
     remaining = max_total_chars
@@ -191,11 +216,51 @@ def _read_file_live(path: Path, *, max_chars: int) -> str:
             return f"<binary file: {path} ({len(raw)} bytes)>"
 
         text = raw.decode("utf-8", errors="replace")
-        if len(text) <= max_chars:
-            return text
-        return f"{text[:max_chars]}\n… [{len(text) - max_chars} more chars]"
+        return _render_numbered_file_block(path, text, max_chars=max_chars)
     except Exception as exc:
         return f"<error reading {path}: {type(exc).__name__}: {exc}>"
+
+
+def _render_numbered_file_block(path: Path, text: str, *, max_chars: int) -> str:
+    """Render text with line numbers + file fingerprint within a char budget."""
+    text_no_cr = text.replace("\r\n", "\n")
+    all_lines = text_no_cr.split("\n")
+    if all_lines and all_lines[-1] == "":
+        all_lines = all_lines[:-1]
+
+    line_count = len(all_lines)
+    digest = hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
+
+    header = (
+        f"# file: {path}\n"
+        f"# sha256: {digest}\n"
+        f"# lines: {line_count}\n"
+    )
+
+    if max_chars <= len(header):
+        return header[:max_chars]
+
+    remaining = max_chars - len(header)
+    rendered: list[str] = []
+    used = 0
+
+    for idx, line in enumerate(all_lines, start=1):
+        numbered = f"{idx:5d} | {line}\n"
+        if used + len(numbered) > remaining:
+            break
+        rendered.append(numbered)
+        used += len(numbered)
+
+    shown_lines = len(rendered)
+    body = "".join(rendered)
+
+    if shown_lines < line_count:
+        omitted = line_count - shown_lines
+        trailer = f"… [truncated {omitted} line(s); use read_file_lines() for targeted ranges]\n"
+        if used + len(trailer) <= remaining:
+            body += trailer
+
+    return header + body
 
 
 def _describe_image(path: Path) -> str:

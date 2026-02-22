@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable
 
 import dspy
@@ -67,6 +69,12 @@ class ReactiveAgent:
             agent=self,
             spawn_agent=self.spawn,
             look_at=self.look_at,
+            file_fingerprint=self.file_fingerprint,
+            read_file_lines=self.read_file_lines,
+            edit_file_lines=self.edit_file_lines,
+            edit_file=self.edit_file_lines,
+            safe_patch=self.safe_patch,
+            context_stats=self.context_stats,
             context_add=self.context_add,
             context_add_file=self.context_add_file,
             context_add_text=self.context_add_text,
@@ -112,6 +120,274 @@ class ReactiveAgent:
     def active_image_labels(self) -> list[str]:
         return [label for label, _ in self._active_images]
 
+    # ── file inspection / editing helpers ───────────────────────────
+    def _resolve_file_path(self, path: str) -> Path:
+        p = Path(path).expanduser()
+        if not p.is_absolute():
+            p = (Path.cwd() / p)
+        p = p.resolve()
+        if not p.exists() or not p.is_file():
+            raise FileNotFoundError(str(p))
+        return p
+
+    @staticmethod
+    def _sha256_text(text: str) -> str:
+        return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
+
+    def file_fingerprint(self, path: str) -> dict[str, Any]:
+        """Return stable file metadata for safe line-based editing."""
+        p = self._resolve_file_path(path)
+        raw = p.read_bytes()
+        if b"\x00" in raw[:2048]:
+            raise ValueError(f"Binary file not supported: {p}")
+
+        text = raw.decode("utf-8", errors="replace")
+        lines = text.splitlines(keepends=True)
+        return {
+            "path": str(p),
+            "size_bytes": len(raw),
+            "line_count": len(lines),
+            "sha256": self._sha256_text(text),
+        }
+
+    def read_file_lines(
+        self,
+        path: str,
+        start_line: int = 1,
+        end_line: int | None = None,
+        *,
+        max_chars: int = 12_000,
+    ) -> str:
+        """Read a numbered line range with file/range hashes for precise edits."""
+        p = self._resolve_file_path(path)
+        raw = p.read_bytes()
+        if b"\x00" in raw[:2048]:
+            raise ValueError(f"Binary file not supported: {p}")
+
+        text = raw.decode("utf-8", errors="replace")
+        lines = text.splitlines(keepends=True)
+        line_count = len(lines)
+        if line_count == 0:
+            return f"# file: {p}\n# sha256: {self._sha256_text(text)}\n# lines: 0\n"
+
+        start = max(1, int(start_line or 1))
+        end = int(end_line) if end_line is not None else min(line_count, start + 199)
+        start = min(start, line_count)
+        end = max(start, min(end, line_count))
+
+        segment_lines = lines[start - 1 : end]
+        segment = "".join(segment_lines)
+        file_sha = self._sha256_text(text)
+        segment_sha = self._sha256_text(segment)
+
+        rendered = [
+            f"# file: {p}",
+            f"# file_sha256: {file_sha}",
+            f"# line_range: {start}-{end} / {line_count}",
+            f"# range_sha256: {segment_sha}",
+        ]
+        for idx, line in enumerate(segment_lines, start=start):
+            rendered.append(f"{idx:5d} | {line.rstrip(chr(10)).rstrip(chr(13))}")
+
+        out = "\n".join(rendered)
+        if len(out) <= max_chars:
+            return out
+        clipped = out[:max_chars]
+        omitted = len(out) - max_chars
+        return f"{clipped}\n… [{omitted} more chars clipped]"
+
+    def edit_file_lines(
+        self,
+        path: str,
+        start_line: int,
+        end_line: int,
+        new_content: str,
+        *,
+        expected_file_sha256: str | None = None,
+        expected_range_sha256: str | None = None,
+    ) -> dict[str, Any]:
+        """Replace a line range (inclusive) with optional hash guards."""
+        p = self._resolve_file_path(path)
+        raw = p.read_bytes()
+        if b"\x00" in raw[:2048]:
+            raise ValueError(f"Binary file not supported: {p}")
+
+        old_text = raw.decode("utf-8", errors="replace")
+        old_lines = old_text.splitlines(keepends=True)
+        line_count = len(old_lines)
+
+        if line_count == 0:
+            raise ValueError("Cannot edit an empty file by line range; write the file directly.")
+
+        start = int(start_line)
+        end = int(end_line)
+        if start < 1 or end < start or end > line_count:
+            raise ValueError(f"Invalid line range {start}-{end}; file has {line_count} line(s).")
+
+        old_file_sha = self._sha256_text(old_text)
+        old_segment = "".join(old_lines[start - 1 : end])
+        old_segment_sha = self._sha256_text(old_segment)
+
+        if expected_file_sha256 and expected_file_sha256 != old_file_sha:
+            raise ValueError(
+                "File hash mismatch; file changed since it was inspected. "
+                f"expected={expected_file_sha256} actual={old_file_sha}"
+            )
+        if expected_range_sha256 and expected_range_sha256 != old_segment_sha:
+            raise ValueError(
+                "Range hash mismatch; targeted lines changed. "
+                f"expected={expected_range_sha256} actual={old_segment_sha}"
+            )
+
+        replacement = str(new_content or "")
+        if replacement and old_segment.endswith("\n") and not replacement.endswith("\n"):
+            replacement += "\n"
+        replacement_lines = replacement.splitlines(keepends=True)
+
+        new_lines = old_lines[: start - 1] + replacement_lines + old_lines[end:]
+        new_text = "".join(new_lines)
+        p.write_text(new_text, encoding="utf-8")
+
+        return {
+            "path": str(p),
+            "replaced_range": f"{start}-{end}",
+            "old_file_sha256": old_file_sha,
+            "new_file_sha256": self._sha256_text(new_text),
+            "old_range_sha256": old_segment_sha,
+            "new_range_sha256": self._sha256_text(replacement),
+            "old_line_count": line_count,
+            "new_line_count": len(new_lines),
+        }
+
+    def _parse_read_lines_meta(self, rendered: str) -> dict[str, Any]:
+        file_sha = ""
+        range_sha = ""
+        start = end = total = 0
+
+        for line in rendered.splitlines():
+            if line.startswith("# file_sha256:"):
+                file_sha = line.split(":", 1)[1].strip()
+            elif line.startswith("# range_sha256:"):
+                range_sha = line.split(":", 1)[1].strip()
+            elif line.startswith("# line_range:"):
+                # format: "# line_range: <start>-<end> / <total>"
+                payload = line.split(":", 1)[1].strip()
+                left, _, right = payload.partition("/")
+                left = left.strip()
+                right = right.strip()
+                if "-" in left:
+                    s_raw, e_raw = left.split("-", 1)
+                    start = int(s_raw.strip())
+                    end = int(e_raw.strip())
+                if right:
+                    total = int(right)
+
+        if not file_sha or not range_sha or start <= 0 or end < start:
+            raise ValueError("Could not parse read_file_lines metadata for safe_patch")
+
+        return {
+            "file_sha256": file_sha,
+            "range_sha256": range_sha,
+            "start_line": start,
+            "end_line": end,
+            "line_count": total,
+        }
+
+    def _read_exact_lines(self, path: str, start_line: int, end_line: int) -> str:
+        p = self._resolve_file_path(path)
+        text = p.read_text(encoding="utf-8", errors="replace")
+        lines = text.splitlines(keepends=True)
+        if start_line < 1 or end_line < start_line or end_line > len(lines):
+            raise ValueError(f"Invalid line range {start_line}-{end_line}")
+        return "".join(lines[start_line - 1 : end_line])
+
+    def _locate_text_line_range(self, path: str, expected_old_text: str) -> tuple[int, int] | None:
+        needle = str(expected_old_text or "")
+        if not needle:
+            return None
+
+        p = self._resolve_file_path(path)
+        haystack = p.read_text(encoding="utf-8", errors="replace")
+
+        idx = haystack.find(needle)
+        if idx < 0:
+            return None
+        if haystack.find(needle, idx + 1) >= 0:
+            # Ambiguous occurrence; don't guess.
+            return None
+
+        start_line = haystack.count("\n", 0, idx) + 1
+        line_span = needle.count("\n")
+        if not needle.endswith("\n"):
+            line_span += 1
+        end_line = start_line + max(1, line_span) - 1
+        return (start_line, end_line)
+
+    def safe_patch(
+        self,
+        path: str,
+        start_line: int,
+        end_line: int,
+        new_content: str,
+        *,
+        expected_old_text: str | None = None,
+        max_retries: int = 1,
+    ) -> dict[str, Any]:
+        """Convenience wrapper: fingerprint/read/hash-guarded line patch with retry.
+
+        Flow per attempt:
+          1) read_file_lines(path, start, end) -> parse hashes
+          2) edit_file_lines(..., expected_file_sha256=..., expected_range_sha256=...)
+          3) on mismatch, optionally relocate by expected_old_text and retry
+        """
+        target_start = int(start_line)
+        target_end = int(end_line)
+        attempts = max(0, int(max_retries)) + 1
+        last_error: Exception | None = None
+
+        for attempt in range(1, attempts + 1):
+            try:
+                rendered = self.read_file_lines(path, target_start, target_end, max_chars=120_000)
+                meta = self._parse_read_lines_meta(rendered)
+
+                if expected_old_text is not None:
+                    current_segment = self._read_exact_lines(path, meta["start_line"], meta["end_line"])
+                    if current_segment != expected_old_text:
+                        relocated = self._locate_text_line_range(path, expected_old_text)
+                        if relocated is None:
+                            raise ValueError(
+                                "safe_patch: expected_old_text no longer matches target range "
+                                "and could not be uniquely relocated"
+                            )
+                        target_start, target_end = relocated
+                        rendered = self.read_file_lines(path, target_start, target_end, max_chars=120_000)
+                        meta = self._parse_read_lines_meta(rendered)
+
+                result = self.edit_file_lines(
+                    path,
+                    meta["start_line"],
+                    meta["end_line"],
+                    new_content,
+                    expected_file_sha256=meta["file_sha256"],
+                    expected_range_sha256=meta["range_sha256"],
+                )
+                result["safe_patch_attempts"] = attempt
+                result["safe_patch_requested_range"] = f"{start_line}-{end_line}"
+                result["safe_patch_applied_range"] = result.get("replaced_range")
+                return result
+            except Exception as exc:
+                last_error = exc
+                if attempt >= attempts:
+                    raise
+                if expected_old_text is not None:
+                    relocated = self._locate_text_line_range(path, expected_old_text)
+                    if relocated is not None:
+                        target_start, target_end = relocated
+
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("safe_patch failed")
+
     # ── pinned context (human-managed) ──────────────────────────────
     def context_list(self) -> list[dict[str, Any]]:
         return list_items(self.kernel.shell.user_ns)
@@ -156,6 +432,28 @@ class ReactiveAgent:
 
     def render_pinned_context(self) -> str:
         return render_for_prompt(self.kernel.shell.user_ns)
+
+    def context_stats(self) -> dict[str, Any]:
+        """Return reliable pinned-context diagnostics (avoids false-positive substring checks)."""
+        rendered = self.render_pinned_context()
+        lines = rendered.splitlines()
+
+        shown_item_headers = sum(1 for line in lines if line.startswith("### ctx"))
+        has_top_level_item_cap = any(
+            line.startswith("… ") and "more pinned context items not shown" in line
+            for line in lines
+        )
+        top_level_line_truncation_count = sum(
+            1 for line in lines if line.startswith("… [truncated ")
+        )
+
+        return {
+            "total_pinned_items": len(self.context_list()),
+            "rendered_chars": len(rendered),
+            "shown_item_headers": shown_item_headers,
+            "item_cap_reached": has_top_level_item_cap,
+            "line_truncation_markers": top_level_line_truncation_count,
+        }
 
     # ── build the compact environment state ─────────────────────────
     def build_environment_state(

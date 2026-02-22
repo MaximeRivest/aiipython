@@ -85,7 +85,6 @@ def _reset_dspy_config_ownership() -> None:
 
 def _prepare_session(
     model: str | None = None,
-    lm_backend: str | None = None,
     *,
     defer_lm_setup: bool = False,
 ):
@@ -95,13 +94,11 @@ def _prepare_session(
     import dspy
 
     from aiipython.auth import ENV_KEY_MAP, get_auth_manager
+    from aiipython.mlflow_integration import configure_mlflow_from_env
     from aiipython.settings import DEFAULT_MODEL, get_settings
 
     auth = get_auth_manager()
     settings = get_settings()
-
-    if lm_backend:
-        os.environ["AIIPYTHON_LM_BACKEND"] = lm_backend
 
     if model:
         model_str = model
@@ -127,6 +124,9 @@ def _prepare_session(
         if env_var:
             os.environ[env_var] = auth_source.key
 
+    # Optional MLflow tracing for DSPy calls (must be enabled before dspy.configure).
+    configure_mlflow_from_env()
+
     if defer_lm_setup:
         _reset_dspy_config_ownership()
     elif not hasattr(dspy.settings, "lm") or dspy.settings.lm is None or model:
@@ -134,10 +134,6 @@ def _prepare_session(
 
         lm = create_lm(model_str)
         dspy.configure(lm=lm)
-
-    from aiipython.wire import get_wire_log
-
-    get_wire_log()
 
     shell = None
     try:
@@ -159,130 +155,46 @@ def _prepare_session(
     return session
 
 
-def _run_textual(session) -> None:
-    """Run legacy Textual frontend."""
-    import os
-
-    if "AIIPYTHON_BG" not in os.environ and "PYCODE_BG" not in os.environ:
-        detected_bg = _detect_terminal_background()
-        os.environ["AIIPYTHON_BG"] = detected_bg or "ansi_default"
-
-    if "AIIPYTHON_BG" in os.environ:
-        os.environ["PYCODE_BG"] = os.environ["AIIPYTHON_BG"]
-    elif "PYCODE_BG" in os.environ:
-        os.environ["AIIPYTHON_BG"] = os.environ["PYCODE_BG"]
-
-    from aiipython.app import AiiPythonApp
-
-    app = AiiPythonApp(session=session)
-
-    inline_env = (
-        os.environ.get("AIIPYTHON_INLINE")
-        or os.environ.get("PYCODE_INLINE")
-        or "1"
-    ).lower()
-    inline = inline_env in ("1", "true", "yes")
-
-    os.environ["AIIPYTHON_INLINE"] = "1" if inline else "0"
-    os.environ["PYCODE_INLINE"] = os.environ["AIIPYTHON_INLINE"]
-
-    app.run(inline=inline, inline_no_clear=inline)
-
-
 def chat(
     model: str | None = None,
     ui: str | None = None,
-    lm_backend: str | None = None,
+    mlflow: bool | None = None,
 ) -> None:
     """Launch aiipython from an IPython session.
 
     Args:
         model: Optional model override (``provider/model``).
-        ui: Frontend selector:
-            - ``"pi-native"`` (default, real Pi InteractiveMode)
-            - ``"pi-tui"`` (custom frontend)
-            - ``"textual"`` (legacy)
-        lm_backend: Optional LM routing override:
-            - ``"auto"`` (default behavior)
-            - ``"pi"``
-            - ``"litellm"``
-
+        mlflow: Optional MLflow tracing toggle. ``True`` sets
+            ``AIIPYTHON_MLFLOW=1`` for this process.
     Usage::
 
         In [1]: from aiipython import chat
         In [2]: chat()
         In [3]: chat("openai/gpt-4o-mini")
-        In [4]: chat(ui="textual")
-        In [5]: chat(lm_backend="pi")
+        In [4]: chat(mlflow=True)
     """
     import os
     import sys
 
-    ui_choice = (ui or os.environ.get("AIIPYTHON_UI") or "pi-native").strip().lower()
+    if mlflow is True:
+        os.environ["AIIPYTHON_MLFLOW"] = "1"
+    elif mlflow is False:
+        os.environ["AIIPYTHON_MLFLOW"] = "0"
 
     session = _prepare_session(
         model=model,
-        lm_backend=lm_backend,
-        defer_lm_setup=ui_choice in {"pi-native", "native", "pi-full", "pi-interactive"},
+        defer_lm_setup=True,
     )
 
-    if ui_choice in {"textual", "legacy", "pycode"}:
-        _run_textual(session)
-        return
+    from aiipython.pi_native import run_pi_native
 
-    if ui_choice in {"pi-native", "native", "pi-full", "pi-interactive"}:
-        from aiipython.pi_tui_bridge import run_pi_native
-
-        try:
-            run_pi_native(session)
-            return
-        except Exception as exc:
-            strict = (os.environ.get("AIIPYTHON_UI_STRICT") or "").lower() in {"1", "true", "yes"}
-            if strict:
-                raise
-            print(
-                f"[aiipython] pi-native frontend failed ({exc}); falling back to pi-tui.",
-                file=sys.stderr,
-            )
-
-            # pi-native may defer LM setup to the backend thread; ensure LM is ready
-            # before using pi-tui/textual fallback paths.
-            try:
-                import dspy
-
-                if not hasattr(dspy.settings, "lm") or dspy.settings.lm is None:
-                    session.switch_model(session.model)
-            except Exception:
-                pass
-
-            from aiipython.pi_tui_bridge import run_pi_tui
-
-            try:
-                run_pi_tui(session)
-                return
-            except Exception as exc2:
-                print(
-                    f"[aiipython] pi-tui frontend failed ({exc2}); falling back to Textual.",
-                    file=sys.stderr,
-                )
-                _run_textual(session)
-                return
-
-    if ui_choice in {"pi", "pi-tui", "pitui"}:
-        from aiipython.pi_tui_bridge import run_pi_tui
-
-        try:
-            run_pi_tui(session)
-            return
-        except Exception as exc:
-            strict = (os.environ.get("AIIPYTHON_UI_STRICT") or "").lower() in {"1", "true", "yes"}
-            if strict:
-                raise
-            print(
-                f"[aiipython] pi-tui frontend failed ({exc}); falling back to Textual.",
-                file=sys.stderr,
-            )
-            _run_textual(session)
-            return
-
-    raise ValueError(f"Unknown ui '{ui_choice}'. Use 'pi-native', 'pi-tui' or 'textual'.")
+    try:
+        run_pi_native(session)
+    except Exception as exc:
+        strict = (os.environ.get("AIIPYTHON_UI_STRICT") or "").lower() in {"1", "true", "yes"}
+        if strict:
+            raise
+        print(
+            f"[aiipython] pi-native frontend failed ({exc}).",
+            file=sys.stderr,
+        )
